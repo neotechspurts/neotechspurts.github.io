@@ -1,0 +1,186 @@
+/* ============================================================
+   Trap Dungeons 2 - player.js
+   One self-contained controller instead of globals scattered
+   across scenes. Physics run on the fixed timestep; collision
+   resolves one axis at a time against the room grid, so the
+   player never tunnels through tiles or snags on seams.
+   Feel-good extras a rage game cannot live without:
+     coyote time   - you can still jump for 80ms after a ledge
+     jump buffer   - a press 100ms before landing still counts
+     variable jump - release early for a shorter hop
+   ============================================================ */
+'use strict';
+
+(function (TD) {
+
+  var T = TD.TILE;
+
+  var GRAVITY     = 1500;
+  var MAX_FALL    = 900;
+  var MOVE_SPEED  = 150;
+  var JUMP_VEL    = -480;
+  var JUMP_CUT    = -180;   // velocity cap when the button is released
+  var COYOTE_TIME = 0.08;
+  var BUFFER_TIME = 0.10;
+
+  function Player() {
+    this.w = 12;
+    this.h = 24;
+    this.reset(0, 0);
+  }
+
+  Player.prototype.reset = function (x, y) {
+    this.x = x;
+    this.y = y;
+    this.vx = 0;
+    this.vy = 0;
+    this.onGround = false;
+    this.facing = 1;
+    this.dead = false;
+    this.coyoteT = 0;
+    this.bufferT = 0;
+    this.animT = 0;
+    this.stepT = 0;
+  };
+
+  Player.prototype.spawnInRoom = function (room) {
+    this.reset(
+      room.spawn.col * T + (T - this.w) / 2,
+      room.spawn.row * T + T - this.h
+    );
+  };
+
+  Player.prototype.update = function (dt, inp, room) {
+    if (this.dead) return;
+
+    // ----- horizontal intent -----
+    var dir = 0;
+    if (TD.Input.left)  dir -= 1;
+    if (TD.Input.right) dir += 1;
+    this.vx = dir * MOVE_SPEED;
+    if (dir !== 0) this.facing = dir;
+
+    // ----- jump bookkeeping -----
+    this.coyoteT = this.onGround ? COYOTE_TIME : Math.max(0, this.coyoteT - dt);
+    if (inp.jumpPressed) this.bufferT = BUFFER_TIME;
+    else this.bufferT = Math.max(0, this.bufferT - dt);
+
+    if (this.bufferT > 0 && this.coyoteT > 0) {
+      this.vy = JUMP_VEL;
+      this.onGround = false;
+      this.coyoteT = 0;
+      this.bufferT = 0;
+      TD.Audio.jump();
+      TD.Particles.spawn(this.x + this.w / 2, this.y + this.h, {
+        count: 4, colors: ['#cfd2da', '#9a8866'],
+        vyMin: -40, vyMax: 10, vxMin: -60, vxMax: 60, lifeMax: 0.3
+      });
+    }
+
+    // Early release: cut the rise short for precise small hops.
+    if (!TD.Input.jump && this.vy < JUMP_CUT) this.vy = JUMP_CUT;
+
+    // ----- gravity -----
+    this.vy = Math.min(this.vy + GRAVITY * dt, MAX_FALL);
+
+    // ----- move and collide, one axis at a time -----
+    this._moveX(this.vx * dt, room);
+    this._moveY(this.vy * dt, room);
+
+    // ----- walk animation + footsteps -----
+    if (this.onGround && dir !== 0) {
+      this.animT += dt;
+      this.stepT -= dt;
+      if (this.stepT <= 0) { TD.Audio.step(); this.stepT = 0.26; }
+    } else {
+      this.animT = 0;
+      this.stepT = 0;
+    }
+  };
+
+  Player.prototype._moveX = function (dx, room) {
+    this.x += dx;
+    if (dx === 0) return;
+
+    var top = Math.floor(this.y / T);
+    var bottom = Math.floor((this.y + this.h - 0.01) / T);
+
+    if (dx > 0) {
+      var right = Math.floor((this.x + this.w) / T);
+      for (var r = top; r <= bottom; r++) {
+        if (room.isSolid(right, r)) {
+          this.x = right * T - this.w;
+          this.vx = 0;
+          break;
+        }
+      }
+    } else {
+      var left = Math.floor(this.x / T);
+      for (var r2 = top; r2 <= bottom; r2++) {
+        if (room.isSolid(left, r2)) {
+          this.x = (left + 1) * T;
+          this.vx = 0;
+          break;
+        }
+      }
+    }
+  };
+
+  Player.prototype._moveY = function (dy, room) {
+    this.y += dy;
+    var left = Math.floor((this.x + 0.01) / T);
+    var right = Math.floor((this.x + this.w - 0.01) / T);
+
+    if (dy >= 0) {
+      this.onGround = false;
+      var bottom = Math.floor((this.y + this.h) / T);
+      for (var c = left; c <= right; c++) {
+        if (room.isSolid(c, bottom)) {
+          this.y = bottom * T - this.h;
+          this.vy = 0;
+          this.onGround = true;
+          break;
+        }
+      }
+    } else {
+      var top = Math.floor(this.y / T);
+      for (var c2 = left; c2 <= right; c2++) {
+        if (room.isSolid(c2, top)) {
+          this.y = (top + 1) * T;
+          this.vy = 0;
+          break;
+        }
+      }
+    }
+  };
+
+  Player.prototype.draw = function (ctx) {
+    if (this.dead) return;
+
+    var frames = TD.GFX.player;
+    var img = frames.idle;
+    if (!this.onGround) {
+      img = frames.walk[1] || frames.idle;
+    } else if (this.vx !== 0) {
+      img = frames.walk[Math.floor(this.animT / 0.09) % frames.walk.length] || frames.idle;
+    }
+    if (!img) return;
+
+    // Sprite is wider/taller than the hitbox: center it, align feet.
+    var dx = Math.round(this.x + this.w / 2 - img.width / 2);
+    var dy = Math.round(this.y + this.h - img.height);
+
+    if (this.facing === 1) {
+      ctx.drawImage(img, dx, dy);
+    } else {
+      ctx.save();
+      ctx.translate(dx + img.width, dy);
+      ctx.scale(-1, 1);
+      ctx.drawImage(img, 0, 0);
+      ctx.restore();
+    }
+  };
+
+  TD.Player = Player;
+
+})(window.TD);
