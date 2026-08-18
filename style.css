@@ -6,12 +6,12 @@
 
 @font-face {
   font-family: 'Upheave';
-  src: url('../assets/Upheave.ttf') format('truetype');
+  src: url('../fonts/Upheave.ttf') format('truetype');
   font-display: swap;
 }
 @font-face {
   font-family: 'Minecraftia';
-  src: url('../assets/Minecraftia.ttf') format('truetype');
+  src: url('../fonts/Minecraftia.ttf') format('truetype');
   font-display: swap;
 }
 
