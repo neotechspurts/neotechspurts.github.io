@@ -1,0 +1,1275 @@
+/* ============================================================
+   Trap Dungeons 2 - game.js
+   The conductor. Owns the state machine (boot / menu / play /
+   win), the Room abstraction the traps talk to, the death and
+   respawn flow, the HUD and the screen transitions.
+
+   Design notes vs v1:
+   - One Room class replaces N copy-pasted Phaser scenes.
+   - Traps never touch globals: they receive a context object
+     ({player, room, memory, kill}) and report deaths upward.
+   - The static part of a room renders once into an offscreen
+     canvas; the per-frame cost on mobile stays tiny.
+   ============================================================ */
+'use strict';
+
+(function (TD) {
+
+  var T = TD.TILE;
+
+  /* ============================================================
+     Room: parses the ASCII map, owns collision, hazards,
+     pickups, doors and the trap instances.
+     ============================================================ */
+  function Room(def, index, memory) {
+    this.def = def;
+    this.index = index;
+    this.memory = memory;
+
+    this.solid = [];        // [row][col] static collision
+    this.dynamic = [];      // [row][col] trap-made collision
+    this.hidden = {};       // 'c,r' -> true, statics a trap took over
+    this.hazards = [];      // static spikes {col,row,up}
+    this.springs = [];      // {col,row,mega}
+    this.hearts = [];       // {col,row,taken,bob}
+    this.doors = [];        // {col,row,pop} real exits
+    this.spawn = { col: 1, row: 1 };
+
+    this.memory = memory;
+    this._parse();
+    this._bakeStatic();
+
+    // Doors revealed in earlier attempts of this room come back.
+    var revealed = memory.revealedDoors || [];
+    for (var ri = 0; ri < revealed.length; ri++) {
+      this.doors.push({ col: revealed[ri][0], row: revealed[ri][1], pop: 0 });
+    }
+
+    // Real traps from the level data plus auto-generated crumble
+    // bricks for every 'c' in the map (they reuse the vanish logic).
+    var defs = (def.traps || []).slice();
+    if (this._crumbleTiles.length) {
+      defs.push({ type: 'vanish', tiles: this._crumbleTiles });
+    }
+    var self = this;
+    this.traps = defs.map(function (d, i) { return TD.createTrap(d, i); });
+    this.traps.forEach(function (t) { TD.initTrap(t, self, memory); });
+  }
+
+  Room.prototype._parse = function () {
+    var map = this.def.map;
+    this._crumbleTiles = [];
+    this._tiles = map;
+
+    for (var r = 0; r < TD.ROOM_H; r++) {
+      this.solid.push([]);
+      this.dynamic.push([]);
+      for (var c = 0; c < TD.ROOM_W; c++) {
+        var ch = map[r].charAt(c);
+        this.solid[r][c] = (ch === '#' || ch === '=');
+        this.dynamic[r][c] = false;
+
+        switch (ch) {
+          case '^': this.hazards.push({ col: c, row: r, up: true });  break;
+          case 'v': this.hazards.push({ col: c, row: r, up: false }); break;
+          case 'c': this._crumbleTiles.push([c, r]); break;
+          case 's': this.springs.push({ col: c, row: r, mega: false }); break;
+          case 'S': this.springs.push({ col: c, row: r, mega: true });  break;
+          case 'h': this.hearts.push({ col: c, row: r,
+            taken: !!(this.memory && this.memory.heartsTaken && this.memory.heartsTaken[c + ',' + r]),
+            bob: Math.random() * 6 }); break;
+          case 'P': this.spawn = { col: c, row: r }; break;
+          case 'D': this.doors.push({ col: c, row: r, pop: 0 }); break;
+        }
+      }
+    }
+  };
+
+  // Pre-render everything that never changes into one canvas.
+  Room.prototype._bakeStatic = function () {
+    this.staticCanvas = document.createElement('canvas');
+    this.staticCanvas.width = TD.VIEW_W;
+    this.staticCanvas.height = TD.VIEW_H;
+    var x = this.staticCanvas.getContext('2d');
+    x.imageSmoothingEnabled = false;
+
+    var G = TD.GFX;
+    for (var r = 0; r < TD.ROOM_H; r++) {
+      for (var c = 0; c < TD.ROOM_W; c++) {
+        if (this.hidden[c + ',' + r]) continue;
+        var ch = this._tiles[r].charAt(c);
+        switch (ch) {
+          case '#':
+          case '~':   // the fake brick looks EXACTLY like a real one
+            x.drawImage(G.tileAt(c, r), c * T, r * T, T, T);
+            break;
+          case '=':
+            x.drawImage(G.cur.half, c * T, r * T, T, T);
+            break;
+          case '^':
+          case 'x':   // the fake spike looks EXACTLY like a real one
+            x.drawImage(G.cur.spike, 0, 0, 32, 15, c * T, (r + 1) * T - 15, 32, 15);
+            break;
+          case 'v':
+            x.save();
+            x.translate(c * T + 16, r * T + 7.5);
+            x.scale(1, -1);
+            x.drawImage(G.cur.spike, -16, -7.5, 32, 15);
+            x.restore();
+            break;
+        }
+      }
+    }
+
+    // wall torches near the spawn and the first mapped door
+    this.torches = [];
+    var self2 = this, anchors = [this.spawn].concat(this.doors.slice(0, 1));
+    anchors.forEach(function (a) {
+      if (!a) return;
+      var tc = a.col, trw = a.row - 1;
+      if (trw >= 0 && trw < TD.ROOM_H && tc >= 0 && tc < TD.ROOM_W &&
+          !self2.isSolid(tc, trw)) {
+        self2.torches.push({ x: tc * T + T / 2, y: trw * T + 18 });
+      }
+    });
+  };
+
+  // ---------- API used by traps.js ----------
+
+  Room.prototype.isSolid = function (col, row) {
+    if (col < 0 || col >= TD.ROOM_W) return true;   // side walls
+    if (row < 0 || row >= TD.ROOM_H) return false;  // open sky / pit
+    return this.solid[row][col] || this.dynamic[row][col];
+  };
+
+  Room.prototype.setDynamic = function (col, row, on) {
+    if (row < 0 || row >= TD.ROOM_H || col < 0 || col >= TD.ROOM_W) return;
+    this.dynamic[row][col] = !!on;
+  };
+
+  Room.prototype.hideStatic = function (col, row) {
+    this.hidden[col + ',' + row] = true;
+    this.hazards = this.hazards.filter(function (h) {
+      return !(h.col === col && h.row === row);
+    });
+    this._bakeStatic();
+  };
+
+  Room.prototype.addDoor = function (col, row) {
+    this.doors.push({ col: col, row: row, pop: 0.35 });
+    (this.memory.revealedDoors = this.memory.revealedDoors || []).push([col, row]);
+    TD.Particles.spawn(col * T + T / 2, row * T + T / 2,
+      { count: 10, colors: ['#ffe07a', '#fff'], gravity: 200 });
+  };
+
+  Room.prototype.ejectPlayer = function (p, tiles) {
+    tiles.forEach(function (t) {
+      var bx = t[0] * T, by = t[1] * T;
+      if (!TD.aabb(p.x, p.y, p.w, p.h, bx, by, T, T)) return;
+      // Smallest displacement that frees the player, vertical first.
+      var upDist    = (p.y + p.h) - by;
+      var downDist  = (by + T) - p.y;
+      var leftDist  = (p.x + p.w) - bx;
+      var rightDist = (bx + T) - p.x;
+      var m = Math.min(upDist, downDist, leftDist, rightDist);
+      if (m === upDist)        { p.y = by - p.h; p.vy = Math.min(p.vy, 0); p.onGround = true; }
+      else if (m === downDist) { p.y = by + T;   p.vy = Math.max(p.vy, 0); }
+      else if (m === leftDist) { p.x = bx - p.w; }
+      else                     { p.x = bx + T;   }
+    });
+  };
+
+  // ---------- per-frame ----------
+
+  Room.prototype.update = function (dt, ctx) {
+    this.traps.forEach(function (t) { t.update(dt, ctx); });
+    this.doors.forEach(function (d) { d.pop = Math.max(0, d.pop - dt); });
+    this.hearts.forEach(function (h) { h.bob += dt; });
+    this.springs.forEach(function (s) {
+      if (s.squash) s.squash = Math.max(0, s.squash - dt);
+    });
+  };
+
+  Room.prototype.checkHazards = function (p, kill) {
+    for (var i = 0; i < this.hazards.length; i++) {
+      var h = this.hazards[i];
+      var rect = h.up
+        ? { x: h.col * T + 5, y: h.row * T + 18, w: T - 10, h: 14 }
+        : { x: h.col * T + 5, y: h.row * T,      w: T - 10, h: 14 };
+      if (TD.aabb(p.x, p.y, p.w, p.h, rect.x, rect.y, rect.w, rect.h)) {
+        kill('spike');
+        return;
+      }
+    }
+  };
+
+  Room.prototype.checkSprings = function (p) {
+    if (p.vy < 0) return;
+    for (var i = 0; i < this.springs.length; i++) {
+      var s = this.springs[i];
+      var sx = s.col * T, sy = s.row * T;
+      var feet = p.y + p.h;
+      if (p.x + p.w > sx + 4 && p.x < sx + T - 4 &&
+          feet > sy + 8 && feet <= sy + T) {
+        p.y = sy + 14 - p.h;
+        p.vy = s.mega ? -760 : -640;
+        p.onGround = false;
+        s.squash = 0.18;
+        TD.Audio.spring();
+        TD.Particles.spawn(sx + T / 2, sy + 16, {
+          count: 5, colors: ['#c2453a', '#cfd2da'], vyMin: -120, vyMax: -40
+        });
+      }
+    }
+  };
+
+  Room.prototype.checkHearts = function (p, onPick) {
+    var self = this;
+    this.hearts.forEach(function (h) {
+      if (h.taken) return;
+      var hx = h.col * T + 7, hy = h.row * T + 7;
+      if (TD.aabb(p.x, p.y, p.w, p.h, hx, hy, 18, 18)) {
+        h.taken = true;
+        if (self.memory) {
+          (self.memory.heartsTaken = self.memory.heartsTaken || {})[h.col + ',' + h.row] = true;
+        }
+        onPick();
+        TD.Particles.spawn(hx + 9, hy + 9, {
+          count: 8, colors: ['#e8485c', '#ff8aa0'], gravity: 250
+        });
+      }
+    });
+  };
+
+  Room.prototype.checkDoors = function (p) {
+    var cx = p.x + p.w / 2, cy = p.y + p.h / 2;
+    for (var i = 0; i < this.doors.length; i++) {
+      var d = this.doors[i];
+      if (cx > d.col * T + 6 && cx < (d.col + 1) * T - 6 &&
+          cy > d.row * T && cy < (d.row + 1) * T) return true;
+    }
+    return false;
+  };
+
+  Room.prototype.resetPickups = function () {
+    var n = 0;
+    this.hearts.forEach(function (h) { if (h.taken) { h.taken = false; n++; } });
+    return n;
+  };
+
+  // ---------- drawing ----------
+
+  Room.prototype.draw = function (ctx) {
+    // torch glow behind everything
+    for (var ti = 0; ti < this.torches.length; ti++) {
+      TD.GFX.drawTorch(ctx, this.torches[ti].x, this.torches[ti].y, TD.Game.gt);
+    }
+
+    ctx.drawImage(this.staticCanvas, 0, 0);
+
+    // springs
+    var i, s;
+    for (i = 0; i < this.springs.length; i++) {
+      s = this.springs[i];
+      var sx = s.col * T, sy = s.row * T;
+      var sq = s.squash ? 4 : 0;
+      ctx.fillStyle = '#555a66';
+      ctx.fillRect(sx + 8, sy + 22 + sq / 2, 16, 8 - sq / 2);   // coil block
+      ctx.fillStyle = '#8a90a0';
+      ctx.fillRect(sx + 10, sy + 24 + sq / 2, 12, 2);
+      ctx.fillStyle = s.mega ? '#ff5a3a' : '#c2453a';           // plate
+      ctx.fillRect(sx + 4, sy + 16 + sq, 24, 6);
+      if (s.mega) {
+        ctx.fillStyle = '#ffd23a';
+        ctx.fillRect(sx + 12, sy + 12 + sq, 8, 4);
+      }
+    }
+
+    // hearts (2x scale, gentle bob)
+    for (i = 0; i < this.hearts.length; i++) {
+      var h = this.hearts[i];
+      if (h.taken) continue;
+      var bob = Math.sin(h.bob * 4) * 2;
+      ctx.drawImage(TD.Assets.img.heart,
+        h.col * T + 7, Math.round(h.row * T + 7 + bob), 18, 18);
+    }
+
+    // real doors
+    for (i = 0; i < this.doors.length; i++) {
+      ctx._drawDoor(this.doors[i].col, this.doors[i].row, false, this.doors[i].pop);
+    }
+
+    // traps draw on top (they own their own visuals)
+    for (i = 0; i < this.traps.length; i++) this.traps[i].draw(ctx);
+
+    // rewarded "reveal": paint the room's lies (paid with an ad)
+    if (this.memory.revealed) this._drawReveal(ctx);
+  };
+
+  // X-ray markers: fake bricks, fake spikes, crumble tiles, fake
+  // doors, and which hanging spikes really fall. Pulsing soft
+  // overlays so the room stays readable.
+  Room.prototype._drawReveal = function (ctx) {
+    var pulse = 0.22 + Math.sin((TD.Game.gt || 0) * 4) * 0.08;
+    var r, c, ch;
+
+    for (r = 0; r < TD.ROOM_H; r++) {
+      for (c = 0; c < TD.ROOM_W; c++) {
+        ch = this._tiles[r].charAt(c);
+        if (ch === '~') {                       // fake brick: crossed out
+          ctx.fillStyle = 'rgba(10,12,20,0.45)';
+          ctx.fillRect(c * T + 2, r * T + 2, T - 4, T - 4);
+          ctx.strokeStyle = 'rgba(122,215,255,0.9)';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(c * T + 7, r * T + 7);  ctx.lineTo(c * T + T - 7, r * T + T - 7);
+          ctx.moveTo(c * T + T - 7, r * T + 7); ctx.lineTo(c * T + 7, r * T + T - 7);
+          ctx.stroke();
+        } else if (ch === 'x') {                // fake spikes: safe tint
+          ctx.fillStyle = 'rgba(122,215,255,' + pulse + ')';
+          ctx.fillRect(c * T, r * T + 14, T, T - 14);
+        } else if (ch === 'c') {                // crumble: crack marks
+          ctx.strokeStyle = 'rgba(20,14,8,0.85)';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(c * T + 8, r * T + 6);   ctx.lineTo(c * T + 14, r * T + 16);
+          ctx.lineTo(c * T + 10, r * T + 26);
+          ctx.moveTo(c * T + 22, r * T + 8);  ctx.lineTo(c * T + 19, r * T + 20);
+          ctx.stroke();
+        }
+      }
+    }
+
+    var self = this;
+    (this.def.traps || []).forEach(function (t) {
+      if (t.type === 'fakedoor' && t.at) {
+        ctx.fillStyle = 'rgba(232,72,92,' + (pulse + 0.1) + ')';
+        ctx.fillRect(t.at[0] * T + 4, t.at[1] * T + 2, T - 8, T - 2);
+      } else if ((t.type === 'dropspike' || t.type === 'popspike') && t.tiles) {
+        ctx.fillStyle = 'rgba(232,72,92,' + pulse + ')';
+        t.tiles.forEach(function (cell) {
+          ctx.fillRect(cell[0] * T + 2, cell[1] * T + 2, T - 4, T - 4);
+        });
+      } else if (t.type === 'tracker' && t.clamp) {
+        ctx.fillStyle = 'rgba(232,72,92,' + pulse + ')';
+        ctx.fillRect(t.clamp[0] * T - 16, t.y * T - 8,
+          (t.clamp[1] - t.clamp[0]) * T + 32, 16);
+      } else if ((t.type === 'movedoor' || t.type === 'trapheart' ||
+                  t.type === 'fakespring') && t.at) {
+        ctx.fillStyle = 'rgba(232,72,92,' + pulse + ')';
+        ctx.fillRect(t.at[0] * T + 2, t.at[1] * T + 2, T - 4, T - 4);
+      } else if (t.type === 'jumpspikes' && t.tiles) {
+        ctx.fillStyle = 'rgba(232,72,92,' + pulse + ')';
+        t.tiles.forEach(function (cell) {
+          ctx.fillRect(cell[0] * T + 2, cell[1] * T + 2, T - 4, T - 4);
+        });
+      }
+    });
+  };
+
+  /* ============================================================
+     Game
+     ============================================================ */
+
+  TD.Game = {
+    state: 'boot',
+    roomIndex: 0,
+    room: null,
+    player: null,
+    deaths: 0,
+    hearts: 0,
+    time: 0,
+    gt: 0,                 // global clock for pulsing effects
+    deathT: 0,
+    flash: 0,
+    tipT: 0,
+    winT: 0,
+    memoryByRoom: {},
+    startBtnRect: null,
+    loadFailed: [],
+
+    boot: function () {
+      var self = this;
+      TD.Screen.init();
+      TD.I18N.init();
+      TD.GFX.init();
+      TD.Input.init();
+      this.mode = TD.store.get('td2.mode', 'normal');
+      if (['easy', 'normal', 'hard'].indexOf(this.mode) < 0) this.mode = 'normal';
+      this.menuSel = this.MENU_ORDER.indexOf(this.mode);
+      if (this.menuSel < 0) this.menuSel = 0;
+      this._installDoorPainter(TD.Screen.ctx);
+      this.player = new TD.Player();
+
+      // mute button (DOM)
+      var mb = document.getElementById('mute-btn');
+      if (mb) {
+        mb.addEventListener('pointerdown', function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          self.toggleMute();
+        });
+        if (TD.Audio.muted) mb.classList.add('muted');
+      }
+
+      var lb = document.getElementById('lang-btn');
+      if (lb) {
+        lb.addEventListener('pointerdown', function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          self.toggleLang();
+        });
+      }
+
+      TD.Ads.hooks.onPause = function () {
+        self.adPaused = true;
+        TD.Audio.duck(true);
+        self.syncHelpBtn();
+      };
+      TD.Ads.hooks.onResume = function () {
+        self.adPaused = false;
+        TD.Audio.duck(false);
+        self.syncHelpBtn();
+      };
+      TD.Ads.init();
+      TD.Platform.init();
+      TD.Platform.loading(10);
+
+      var hb = document.getElementById('help-btn');
+      if (hb) {
+        hb.addEventListener('pointerdown', function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          self.openHelp();
+        });
+      }
+
+      TD.validateLevels();
+
+      TD.Assets.load(function (failed) {
+        TD.Platform.loading(95);
+        self.loadFailed = failed;
+        if (failed.length) {
+          console.warn('Asset mancanti:', failed.join(', '));
+        }
+        TD.Platform.loaded().then(function () {
+          self.state = 'menu';
+          TD.Music.play('menu');
+        });
+      });
+
+      TD.Loop.update = function (dt) { self.update(dt); };
+      TD.Loop.render = function (ctx) { self.render(ctx); };
+      TD.Loop.start();
+    },
+
+    toggleMute: function () {
+      var muted = TD.Audio.toggleMute();
+      var mb = document.getElementById('mute-btn');
+      if (mb) mb.classList.toggle('muted', muted);
+    },
+
+    toggleLang: function () {
+      TD.I18N.toggle();
+      TD.Audio.click();
+    },
+
+    retryRoom: function () {
+      if (this.state === 'play' && this.deathT <= 0) this.kill('retry');
+    },
+
+    // ---------- state flow ----------
+
+    MODES: ['easy', 'normal', 'hard'],
+
+    MENU_ORDER: ['normal', 'easy', 'hard'],
+
+    isUnlocked: function (mode) {
+      if (mode === 'normal') return true;
+      return TD.store.get('td2.unlock.' + mode, false) === true;
+    },
+
+    unlock: function (mode) {
+      TD.store.set('td2.unlock.' + mode, true);
+    },
+
+    setMode: function (m) {
+      this.mode = m;
+      this.menuSel = this.MENU_ORDER.indexOf(m);
+      TD.store.set('td2.mode', m);
+    },
+
+    updateMenu: function (inp) {
+      // left/right move the highlight, jump activates, tap activates directly
+      if (this.menuSel == null) this.menuSel = this.MENU_ORDER.indexOf(this.mode);
+      if (this.menuSel < 0) this.menuSel = 0;
+
+      var l = TD.Input.left, r = TD.Input.right;
+      if (l && !this._ml) { this.menuSel = (this.menuSel + this.MENU_ORDER.length - 1) % this.MENU_ORDER.length; TD.Audio.click(); }
+      if (r && !this._mr) { this.menuSel = (this.menuSel + 1) % this.MENU_ORDER.length; TD.Audio.click(); }
+      this._ml = l; this._mr = r;
+
+      if (inp.tapped && this.modeRects) {
+        for (var i = 0; i < this.modeRects.length; i++) {
+          var mr = this.modeRects[i];
+          if (inp.tapX >= mr.x && inp.tapX <= mr.x + mr.w &&
+              inp.tapY >= mr.y && inp.tapY <= mr.y + mr.h) {
+            this.menuSel = i;
+            this.activateMode(this.MENU_ORDER[i]);
+            return;
+          }
+        }
+      }
+      if (inp.jumpPressed) this.activateMode(this.MENU_ORDER[this.menuSel]);
+    },
+
+    // One click does everything: a free/unlocked mode starts at once,
+    // a locked mode opens the rewarded unlock offer.
+    activateMode: function (mode) {
+      if (this.isUnlocked(mode)) {
+        this.startGame(mode);
+      } else {
+        this.openUnlockOffer(mode);
+      }
+    },
+
+    openUnlockOffer: function (mode) {
+      var self = this;
+      this.hideAdOffer();
+      if (!TD.Ads.available()) { this.flashAdNote(TD.t('adFail')); return; }
+      TD.Audio.click();
+
+      var label = mode === 'hard' ? TD.t('unlockHard') : TD.t('unlockEasy');
+      TD.Ads._emit('unlock_offer', { mode: mode });
+      var box = document.createElement('div');
+      box.id = 'ad-offer';
+      box.innerHTML =
+        '<div class="ado-title">' + TD.t('unlockTitle') + '</div>' +
+        '<div class="ado-row" style="flex-direction:column">' +
+        '<button class="ado-watch">\u25b6 ' + label + '</button>' +
+        '<button class="ado-no">' + TD.t('adNo') + '</button></div>';
+      document.body.appendChild(box);
+      this._adOffer = { el: box, offer: { type: 'unlock' } };
+      this._armOfferButtons(box);
+      TD.Platform.ping('SHOW_BUTTON_REWARD');
+
+      box.querySelector('.ado-watch').addEventListener('click', function () {
+        if (this.disabled) return;
+        self.hideAdOffer();
+        TD.Platform.ping('WATCH_VIDEO');
+        TD.Ads.show(function (success) {
+          if (success) {
+            self.unlock(mode);
+            TD.Ads._emit('mode_unlocked', { mode: mode });
+            TD.Audio.win();
+            self.startGame(mode);          // flow straight into play
+          } else {
+            self.flashAdNote(TD.t('adFail'));
+          }
+        });
+      });
+      box.querySelector('.ado-no').addEventListener('click', function () {
+        self.hideAdOffer();
+      });
+    },
+
+    startGame: function (mode) {
+      if (mode) {
+        this.mode = mode;
+        TD.store.set('td2.mode', mode);
+      }
+      this.deaths = 0;
+      this.hearts = 0;
+      this.time = 0;
+      this.memoryByRoom = {};
+      this.skipsUsed = 0;
+      TD.AdDirector.enabled = (this.mode === 'easy');
+      TD.AdDirector.setAssist(this.mode === 'easy');
+      TD.AdDirector.resetRun();
+      this.hideAdOffer();
+      TD.Music.play('game', 0);
+      TD.Particles.clear();
+      TD.Audio.click();
+      this.loadRoom(0, true);
+      this.state = 'play';
+      this.syncHelpBtn();
+      TD.Platform.ping('START_PLAY');
+      TD.Platform.action();          // SDK 3.0: real play has begun
+    },
+
+    loadRoom: function (index, fresh) {
+      if (fresh) this.hideAdOffer();
+      TD.AdDirector.onRoomEnter(fresh);
+      this.roomIndex = index;
+      var act = Math.min(TD.GFX.themes.length - 1, Math.floor(index / 4));
+      TD.GFX.setAct(act);
+      TD.Music.setAct(act);
+      if (fresh || !this.memoryByRoom[index]) this.memoryByRoom[index] = {};
+      this.room = new Room(TD.LEVELS[index], index, this.memoryByRoom[index]);
+      this.player.spawnInRoom(this.room);
+      this.deathT = 0;
+      if (fresh) this.tipT = 2.4;
+    },
+
+    kill: function (reason) {
+      if (this.deathT > 0 || this.player.dead) return;
+      this.player.dead = true;
+      this.deathT = 0.55;
+      this.flash = 1;
+      TD.Audio.die();
+      TD.Shake.hit(4, 0.3);
+      TD.Particles.spawn(
+        this.player.x + this.player.w / 2,
+        this.player.y + this.player.h / 2,
+        { count: 16, colors: ['#e8485c', '#ffffff', '#8a2433'],
+          vyMin: -260, vyMax: -60, vxMin: -160, vxMax: 160 }
+      );
+
+      // A banked heart is an extra life: spend it to shrug off this
+      // death. No death counted, no game over. Without one, the run
+      // takes the hit (a death in CLASSIC, the end in ONE LIFE).
+      if (this.hearts > 0) {
+        this.hearts--;
+        this._heartSaved = true;
+        TD.Particles.spawn(
+          this.player.x + this.player.w / 2, this.player.y + this.player.h / 2,
+          { count: 12, colors: ['#e8485c', '#ff8aa0'], vyMin: -200, vyMax: -40, vxMin: -140, vxMax: 140 }
+        );
+        return;
+      }
+
+      this.deaths++;
+      if (this.mode === 'hard') {
+        this._goOver = true;
+        return;                       // no offers on a final death
+      }
+
+      var offer = TD.AdDirector.onDeath(this);
+      if (offer) this.showAdOffer(offer);
+    },
+
+    /* ---------------- rewarded ads UI + rewards ---------------- */
+
+    showAdOffer: function (offer) {
+      var self = this;
+      this.hideAdOffer();
+
+      var box = document.createElement('div');
+      box.id = 'ad-offer';
+      box.innerHTML =
+        '<div class="ado-title">' + TD.t('adTitle') + '</div>' +
+        '<div class="ado-desc">' +
+          TD.t(offer.type === 'reveal' ? 'adReveal' : 'adSkip') + '</div>' +
+        '<div class="ado-row">' +
+        '  <button class="ado-watch">\u25b6 ' + TD.t('adWatch') + '</button>' +
+        '  <button class="ado-no">' + TD.t('adNo') + '</button>' +
+        '</div>';
+      document.body.appendChild(box);
+      this._adOffer = { el: box, offer: offer };
+      this._armOfferButtons(box);
+      TD.Platform.ping('SHOW_BUTTON_REWARD');
+
+      box.querySelector('.ado-watch').addEventListener('click', function () {
+        if (this.disabled) return;
+        self.hideAdOffer();
+        TD.AdDirector.accepted(offer.type);
+        TD.Platform.ping('WATCH_VIDEO');
+        TD.Ads.show(function (success) {
+          if (success) self.grantReward(offer.type);
+          else self.flashAdNote(TD.t('adFail'));
+        });
+      });
+      box.querySelector('.ado-no').addEventListener('click', function () {
+        self.hideAdOffer();
+        TD.AdDirector.declined(offer.type);
+      });
+
+      this._adOfferTimer = setTimeout(function () {
+        if (self._adOffer) {
+          self.hideAdOffer();
+          TD.AdDirector.ignored(offer.type);
+        }
+      }, TD.AdDirector.cfg.toastSeconds * 1000);
+    },
+
+    hideAdOffer: function () {
+      if (this._adOfferTimer) { clearTimeout(this._adOfferTimer); this._adOfferTimer = null; }
+      if (this._adOffer && this._adOffer.el.parentNode) {
+        this._adOffer.el.parentNode.removeChild(this._adOffer.el);
+      }
+      this._adOffer = null;
+    },
+
+    flashAdNote: function (text) {
+      var note = document.createElement('div');
+      note.className = 'ad-note';
+      note.textContent = text;
+      document.body.appendChild(note);
+      setTimeout(function () {
+        if (note.parentNode) note.parentNode.removeChild(note);
+      }, 2200);
+    },
+
+    grantReward: function (type) {
+      TD.AdDirector.rewardGranted(type);
+      this.flashAdNote(TD.t('adReward'));
+      TD.Audio.door();
+      if (type === 'reveal') {
+        var mem = this.memoryByRoom[this.roomIndex];
+        if (mem) mem.revealed = true;
+      } else if (type === 'skip') {
+        this.skipsUsed++;
+        if (!this.room.def.final && this.roomIndex + 1 < TD.LEVELS.length) {
+          this.loadRoom(this.roomIndex + 1, true);
+        }
+      }
+    },
+
+    // ---------- update ----------
+
+    update: function (dt) {
+      if (this.adPaused) {       // ad on screen: world, timer and
+        TD.Input.consume();      // buffered inputs all stand still
+        return;
+      }
+      this.gt += dt;
+      var inp = TD.Input.consume();
+      TD.Shake.update(dt);
+      TD.Particles.update(dt);
+      this.flash = Math.max(0, this.flash - dt * 3);
+
+      switch (this.state) {
+        case 'menu':
+          this.updateMenu(inp);
+          break;
+        case 'over':
+          this.overT += dt;
+          if (this.overT > 0.8 && (inp.jumpPressed || inp.anyPressed)) {
+            var selfOver = this;
+            TD.AdDirector.maybeInterstitial('over', function () {
+              TD.Platform.stop();          // SDK 3.0: the run is over
+              selfOver.state = 'menu';
+              TD.Particles.clear();
+              TD.Audio.click();
+              TD.Music.play('menu');
+              selfOver.syncHelpBtn();
+            });
+          }
+          break;
+        case 'play':
+          this.updatePlay(dt, inp);
+          break;
+        case 'win':
+          this.winT += dt;
+          if (this.winT > 0.25 && Math.random() < dt * 6) {
+            TD.Particles.spawn(TD.rand(40, TD.VIEW_W - 40), -8, {
+              count: 1, colors: ['#e8485c', '#ffd23a', '#7ad7ff'],
+              vyMin: 60, vyMax: 140, vxMin: -30, vxMax: 30,
+              gravity: 30, lifeMin: 2, lifeMax: 3.2
+            });
+          }
+          if (this.winT > 1 && (inp.jumpPressed || inp.anyPressed)) {
+            var selfWin = this;
+            TD.AdDirector.maybeInterstitial('win', function () {
+              TD.Platform.stop();          // SDK 3.0: the run is over
+              selfWin.state = 'menu';
+              TD.Particles.clear();
+              TD.Audio.click();
+              TD.Music.play('menu');
+            });
+          }
+          break;
+      }
+    },
+
+    updatePlay: function (dt, inp) {
+      var self = this;
+
+      // death freeze, then respawn (room memory survives)
+      if (this.deathT > 0) {
+        this.deathT -= dt;
+        if (this.deathT <= 0) {
+          if (this._goOver) {
+            this._goOver = false;
+            this.state = 'over';
+            this.overT = 0;
+            this.hideAdOffer();
+            this.syncHelpBtn();
+            TD.Music.stop();
+            TD.Audio.troll();
+            TD.Platform.ping('GAME_OVER');
+            TD.Platform.sad();
+            return;
+          }
+          this._heartSaved = false;
+          this.loadRoom(this.roomIndex, false);
+        }
+        return;
+      }
+
+      this.time += dt;
+      TD.AdDirector.tick(dt);
+      this.tipT = Math.max(0, this.tipT - dt);
+
+      var killFn = function (reason) { self.kill(reason); };
+      var ctx = {
+        player: this.player,
+        room: this.room,
+        memory: this.memoryByRoom[this.roomIndex],
+        kill: killFn
+      };
+
+      this.player.update(dt, inp, this.room);
+      this.room.checkSprings(this.player);
+      this.room.update(dt, ctx);
+      if (this.player.dead) return;
+
+      this.room.checkHazards(this.player, killFn);
+      if (this.player.dead) return;
+
+      this.room.checkHearts(this.player, function () {
+        self.hearts++;
+        TD.Audio.step();
+      });
+
+      // fell out of the world
+      if (this.player.y > TD.VIEW_H + 48) { this.kill('fall'); return; }
+
+      // exit
+      if (this.room.checkDoors(this.player)) {
+        if (this.room.def.final) {
+          this.finishGame();
+        } else {
+          TD.Audio.door();
+          var next = this.roomIndex + 1;
+          TD.Platform.updateLevel(next);
+          TD.Platform.score(next);         // score = rooms conquered
+          TD.Platform.ping('LEVEL_COMPLETED');
+          if (next % 4 === 0) {            // act transition: natural break
+            TD.Platform.happy();           // an act survived deserves one
+            var self = this;
+            TD.AdDirector.maybeInterstitial('act', function () {
+              self.loadRoom(next, true);
+            });
+          } else {
+            this.loadRoom(next, true);
+          }
+        }
+      }
+    },
+
+    bestKey: function (what) {
+      return 'td2.best.' + this.mode + '.' + what;
+    },
+
+    getBest: function (what) {
+      var v = TD.store.get(this.bestKey(what), null);
+      if (v === null && this.mode === 'normal') {     // legacy keys
+        v = TD.store.get(what === 'time' ? 'td2.bestTime' : 'td2.bestDeaths', null);
+      }
+      return v;
+    },
+
+    finishGame: function () {
+      this.state = 'win';
+      this.winT = 0;
+      this.hideAdOffer();
+      this.syncHelpBtn();
+      TD.Music.stop();
+      TD.Audio.win();
+      TD.Platform.happy();
+      TD.Platform.updateLevel(TD.LEVELS.length);
+      TD.Platform.score(TD.LEVELS.length);
+      if (this.skipsUsed === 0) {     // records belong to full runs
+        var bestT = this.getBest('time');
+        var bestD = this.getBest('deaths');
+        if (bestT === null || this.time < bestT) TD.store.set(this.bestKey('time'), this.time);
+        if (bestD === null || this.deaths < bestD) TD.store.set(this.bestKey('deaths'), this.deaths);
+      }
+    },
+
+    /* ---------------- easy-mode help (player initiated) ---------------- */
+
+    // Google rewarded ads guidance: protect the opt-in buttons from
+    // accidental taps right as the panel appears (the player may be
+    // hammering jump at the moment of death).
+    _armOfferButtons: function (box) {
+      var btns = box.querySelectorAll('.ado-watch');
+      Array.prototype.forEach.call(btns, function (b) { b.disabled = true; });
+      setTimeout(function () {
+        Array.prototype.forEach.call(btns, function (b) { b.disabled = false; });
+      }, 400);
+    },
+
+    syncHelpBtn: function () {
+      var hb = document.getElementById('help-btn');
+      if (!hb) return;
+      var show = this.mode === 'easy' && this.state === 'play' && !this.adPaused;
+      hb.style.display = show ? 'block' : 'none';
+    },
+
+    openHelp: function () {
+      if (this.state !== 'play' || this.adPaused) return;
+      var self = this;
+      this.hideAdOffer();
+      if (!TD.Ads.available()) { this.flashAdNote(TD.t('adFail')); return; }
+
+      var mem = this.memoryByRoom[this.roomIndex] || {};
+      var canReveal = TD.AdDirector.roomHasLies(this.room.def) &&
+        !mem.revealed && !this.room.def.final;
+      var canSkip = TD.AdDirector.skipsUsed < TD.AdDirector.cfg.skipCap &&
+        !this.room.def.final;
+      if (!canReveal && !canSkip) { this.flashAdNote(TD.t('helpNone')); return; }
+
+      TD.Ads._emit('help_open', {});
+      var box = document.createElement('div');
+      box.id = 'ad-offer';
+      var html = '<div class="ado-title">' + TD.t('helpTitle') + '</div><div class="ado-row" style="flex-direction:column">';
+      if (canReveal) html += '<button class="ado-watch" data-r="reveal">\u25b6 ' + TD.t('adReveal') + '</button>';
+      if (canSkip)   html += '<button class="ado-watch" data-r="skip">\u25b6 ' + TD.t('adSkip') + '</button>';
+      html += '<button class="ado-no">' + TD.t('adNo') + '</button></div>';
+      box.innerHTML = html;
+      document.body.appendChild(box);
+      this._adOffer = { el: box, offer: { type: 'help' } };
+      this._armOfferButtons(box);
+      TD.Platform.ping('SHOW_BUTTON_REWARD');
+
+      Array.prototype.forEach.call(box.querySelectorAll('.ado-watch'), function (btn) {
+        btn.addEventListener('click', function () {
+          if (btn.disabled) return;
+          var type = btn.getAttribute('data-r');
+          self.hideAdOffer();
+          TD.AdDirector.accepted(type);
+          TD.Platform.ping('WATCH_VIDEO');
+          TD.Ads.show(function (success) {
+            if (success) self.grantReward(type);
+            else self.flashAdNote(TD.t('adFail'));
+          });
+        });
+      });
+      box.querySelector('.ado-no').addEventListener('click', function () {
+        self.hideAdOffer();
+      });
+    },
+
+    // ---------- render ----------
+
+    render: function (ctx) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+      if (this.state === 'boot') return this.renderBoot(ctx);
+      if (this.state === 'menu') return this.renderMenu(ctx);
+
+      // play / win / over share the world rendering
+      ctx.drawImage(TD.GFX.cur.bg, 0, 0);
+
+      ctx.save();
+      ctx.translate(Math.round(TD.Shake.x), Math.round(TD.Shake.y));
+      this.room.draw(ctx);
+      if (this.player.onGround && !this.player.dead) {
+        TD.GFX.drawShadow(ctx,
+          this.player.x + this.player.w / 2,
+          this.player.y + this.player.h, 8);
+      }
+      this.player.draw(ctx);
+      TD.Particles.draw(ctx);
+      ctx.restore();
+
+      ctx.drawImage(TD.GFX.vig, 0, 0);
+
+      if (this.flash > 0) {
+        ctx.globalAlpha = this.flash * 0.45;
+        ctx.fillStyle = '#c81e3c';
+        ctx.fillRect(0, 0, TD.VIEW_W, TD.VIEW_H);
+        ctx.globalAlpha = 1;
+      }
+
+      if (this.state === 'play') this.renderHUD(ctx);
+      if (this.state === 'win') this.renderWin(ctx);
+      if (this.state === 'over') this.renderOver(ctx);
+      this.renderFocusGuard(ctx);
+    },
+
+    renderBoot: function (ctx) {
+      ctx.fillStyle = '#101018';
+      ctx.fillRect(0, 0, TD.VIEW_W, TD.VIEW_H);
+      ctx.fillStyle = '#cfd2da';
+      ctx.font = '10px Minecraftia, monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(TD.t('loading'), TD.VIEW_W / 2, TD.VIEW_H / 2);
+      ctx.textAlign = 'left';
+    },
+
+    renderMenu: function (ctx) {
+      var G = TD.GFX;
+      G.setAct(0);
+      ctx.drawImage(G.cur.bg, 0, 0);
+
+      var W = TD.VIEW_W, cx = W / 2, c, r;
+
+      // full stone frame
+      for (c = 0; c < TD.ROOM_W; c++) {
+        ctx.drawImage(G.tileAt(c, 0), c * T, 0, T, T);
+        ctx.drawImage(G.tileAt(c, 9), c * T, TD.VIEW_H - T, T, T);
+      }
+      for (r = 1; r < 9; r++) {
+        ctx.drawImage(G.tileAt(0, r), 0, r * T, T, T);
+        ctx.drawImage(G.tileAt(14, r), 14 * T, r * T, T, T);
+      }
+
+      // ---- compact diorama at the top: the explorer striding toward a
+      // glowing door past a spike strip. The whole story, no logo.
+      var nx = 120, ny = 26, nw = W - 240, nh = 74;
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      ctx.fillRect(nx, ny, nw, nh);
+      ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(nx + 2, ny + 2, nw - 4, nh - 4);
+      G.drawTorch(ctx, nx + 16, ny + 26, this.gt);
+      G.drawTorch(ctx, nx + nw - 16, ny + 26, this.gt + 1.3);
+      var stageY = ny + nh - 14, fx;
+      for (fx = nx + 26; fx < nx + nw - 26; fx += T) {
+        ctx.drawImage(G.tileAt((fx / T) | 0, 4), fx, stageY, T, T);
+      }
+      var spr = G.player.walk[Math.floor(this.gt / 0.14) % G.player.walk.length];
+      var ps = 1.9;
+      ctx.drawImage(spr, Math.round(cx - 64),
+        Math.round(stageY - spr.height * ps), spr.width * ps, spr.height * ps);
+      ctx.drawImage(G.cur.spike, 0, 0, 32, 15, Math.round(cx - 4), stageY - 20, 40, 20);
+      ctx.save();
+      ctx.translate(cx + 48, stageY - 42);
+      ctx.scale(1.3, 1.3);
+      G.drawDoor(ctx, 0, 0, 0, this.gt);
+      ctx.restore();
+
+      // ---- three one-click mode buttons, stacked. CLASSIC is free;
+      // EASY and ONE LIFE are locked until a rewarded ad unlocks them.
+      var labels = {
+        normal: TD.t('modeNormal'), easy: TD.t('modeEasy'), hard: TD.t('modeHard')
+      };
+      var tags = {
+        normal: TD.t('modeNormalTag'), easy: TD.t('modeEasyTag'), hard: TD.t('modeHardTag')
+      };
+      var bw = 300, bh = 40, gap = 9, bx = cx - bw / 2, y0 = 116;
+      this.modeRects = [];
+      for (var i = 0; i < this.MENU_ORDER.length; i++) {
+        var mode = this.MENU_ORDER[i];
+        var by = y0 + i * (bh + gap);
+        var sel = i === this.menuSel;
+        var locked = !this.isUnlocked(mode);
+        this.modeRects.push({ x: bx, y: by, w: bw, h: bh });
+
+        ctx.fillStyle = sel ? 'rgba(255,216,107,0.18)'
+          : (locked ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0.38)');
+        ctx.fillRect(bx, by, bw, bh);
+        ctx.strokeStyle = sel ? '#ffd86b' : 'rgba(255,255,255,0.22)';
+        ctx.lineWidth = sel ? 3 : 2;
+        ctx.strokeRect(bx + 1.5, by + 1.5, bw - 3, bh - 3);
+
+        // label
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.font = '13px Upheave, Minecraftia, monospace';
+        ctx.fillStyle = locked ? '#9aa0ac' : (sel ? '#ffe9a8' : '#e2e4ea');
+        ctx.fillText(labels[mode], bx + 16, by + 15);
+        ctx.font = '7px Minecraftia, monospace';
+        ctx.fillStyle = locked ? '#6e7480' : (sel ? '#cdb878' : '#9aa0ac');
+        ctx.fillText(tags[mode], bx + 16, by + 30);
+
+        // right side: a play chevron for unlocked, a padlock + hint for locked
+        if (locked) {
+          drawLock(ctx, bx + bw - 30, by + bh / 2 - 8, sel);
+          ctx.textAlign = 'right';
+          ctx.font = '7px Minecraftia, monospace';
+          ctx.fillStyle = sel ? '#ffd86b' : '#7a808c';
+          ctx.fillText(TD.t('tapUnlock'), bx + bw - 44, by + bh / 2 + 1);
+        } else {
+          ctx.fillStyle = sel ? '#ffd86b' : '#8a90a0';
+          ctx.beginPath();
+          var ax = bx + bw - 26, ay = by + bh / 2;
+          ctx.moveTo(ax, ay - 7); ctx.lineTo(ax + 10, ay); ctx.lineTo(ax, ay + 7);
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+
+      // ---- best line for the highlighted mode
+      var selMode = this.MENU_ORDER[this.menuSel < 0 ? 0 : this.menuSel];
+      ctx.textAlign = 'center';
+      ctx.font = '8px Minecraftia, monospace';
+      var prevMode = this.mode;
+      this.mode = selMode;
+      var bestT = this.getBest('time');
+      var bestD = this.getBest('deaths');
+      this.mode = prevMode;
+      if (bestT !== null) {
+        ctx.fillStyle = '#cfd2da';
+        ctx.fillText(TD.t('record') + '  ' + fmtTime(bestT) + '   ' +
+          TD.t('deaths') + ' ' + bestD, cx, 286);
+      } else if (Math.floor(this.gt * 2) % 2 === 0) {
+        ctx.fillStyle = '#9aa0ac';
+        ctx.fillText(TD.t('menuHint'), cx, 286);
+      }
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+    },
+
+    // Embeds (the GamePix player runs games in an iframe) can leave
+    // keyboard focus on the parent page: every key seems dead while
+    // the game looks alive. Detect it, say it, and one click fixes
+    // it because pointerdown already calls window.focus().
+    renderFocusGuard: function (ctx) {
+      if (TD.Input.isTouchDevice) return;
+      var focused = true;
+      try { focused = document.hasFocus(); } catch (e) { return; }
+      if (focused) return;
+      ctx.fillStyle = 'rgba(8,8,14,0.55)';
+      ctx.fillRect(0, 118, TD.VIEW_W, 64);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = '10px Minecraftia, monospace';
+      ctx.fillStyle = Math.floor(this.gt * 3) % 2 === 0 ? '#ffe9a8' : '#cfd2da';
+      ctx.fillText(TD.t('focusHint'), TD.VIEW_W / 2, 150);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+    },
+
+    renderOver: function (ctx) {
+      ctx.fillStyle = 'rgba(8,8,14,0.78)';
+      ctx.fillRect(0, 0, TD.VIEW_W, TD.VIEW_H);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#e8485c';
+      ctx.font = '20px Upheave, Minecraftia, monospace';
+      ctx.fillText(TD.t('overTitle'), TD.VIEW_W / 2, 120);
+      ctx.font = '10px Minecraftia, monospace';
+      ctx.fillStyle = '#cfd2da';
+      ctx.fillText(TD.t('overRoom') + '  ' + (this.roomIndex + 1) + '/' + TD.LEVELS.length,
+        TD.VIEW_W / 2, 160);
+      ctx.fillText(TD.t('time') + '  ' + fmtTime(this.time), TD.VIEW_W / 2, 178);
+      if (this.overT > 0.8 && Math.floor(this.gt * 2) % 2 === 0) {
+        ctx.fillStyle = '#8a90a0';
+        ctx.font = '8px Minecraftia, monospace';
+        ctx.fillText(TD.t('backMenu'), TD.VIEW_W / 2, 240);
+      }
+      ctx.textAlign = 'left';
+    },
+
+    renderHUD: function (ctx) {
+      ctx.fillStyle = 'rgba(8,8,14,0.55)';
+      ctx.fillRect(0, 0, TD.VIEW_W, 18);
+
+      ctx.font = '8px Minecraftia, monospace';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#cfd2da';
+      ctx.textAlign = 'left';
+      ctx.fillText((this.roomIndex + 1) + '/' + TD.LEVELS.length + '  ' +
+        TD.tr(this.room.def.name).toUpperCase(), 6, 10);
+
+      ctx.textAlign = 'right';
+      ctx.fillText(fmtTime(this.time), TD.VIEW_W - 6, 10);
+      ctx.fillText(TD.t('deaths') + ' ' + this.deaths, TD.VIEW_W - 64, 10);
+
+      // hearts counter
+      ctx.drawImage(TD.Assets.img.heart, TD.VIEW_W - 168, 4, 11, 11);
+      ctx.textAlign = 'left';
+      ctx.fillText('x' + this.hearts, TD.VIEW_W - 154, 10);
+
+      // room tip
+      var tipText = TD.tr(this.room.def.tip);
+      if (this.tipT > 0 && tipText) {
+        ctx.globalAlpha = TD.clamp(this.tipT, 0, 1);
+        ctx.textAlign = 'center';
+        ctx.fillStyle = 'rgba(8,8,14,0.6)';
+        var w = ctx.measureText(tipText).width + 16;
+        ctx.fillRect((TD.VIEW_W - w) / 2, TD.VIEW_H - 34, w, 16);
+        ctx.fillStyle = '#ffe07a';
+        ctx.fillText(tipText, TD.VIEW_W / 2, TD.VIEW_H - 26);
+        ctx.globalAlpha = 1;
+        ctx.textAlign = 'left';
+      }
+    },
+
+    renderWin: function (ctx) {
+      ctx.fillStyle = 'rgba(8,8,14,0.7)';
+      ctx.fillRect(0, 0, TD.VIEW_W, TD.VIEW_H);
+
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#ffe07a';
+      ctx.font = '20px Upheave, Minecraftia, monospace';
+      ctx.fillText(TD.t('winTitle'), TD.VIEW_W / 2, 110);
+
+      ctx.font = '10px Minecraftia, monospace';
+      ctx.fillStyle = '#cfd2da';
+      ctx.fillText(TD.t('time') + '  ' + fmtTime(this.time), TD.VIEW_W / 2, 150);
+      ctx.fillText(TD.t('deaths') + '  ' + this.deaths, TD.VIEW_W / 2, 168);
+      ctx.fillText(TD.t('hearts') + '  ' + this.hearts, TD.VIEW_W / 2, 186);
+      if (this.skipsUsed > 0) {
+        ctx.fillStyle = '#8a90a0';
+        ctx.fillText(TD.t('winSkips') + '  ' + this.skipsUsed, TD.VIEW_W / 2, 204);
+        ctx.fillStyle = '#cfd2da';
+      }
+
+      if (this.winT > 1 && Math.floor(this.gt * 2) % 2 === 0) {
+        ctx.fillStyle = '#8a90a0';
+        ctx.font = '8px Minecraftia, monospace';
+        ctx.fillText(TD.t('backMenu'), TD.VIEW_W / 2, 240);
+      }
+      ctx.textAlign = 'left';
+    },
+
+    // Doors are drawn through the context so traps.js can paint a
+    // fake one that is pixel-identical to the real exits.
+    _installDoorPainter: function (ctx) {
+      var self = this;
+      ctx._drawDoor = function (col, row, fake, pop) {
+        TD.GFX.drawDoor(ctx, col, row, pop, self.gt);
+      };
+    }
+  };
+
+  // word-wrap a short string centered, up to two lines
+  // a small padlock icon (16x16-ish) for locked menu buttons
+  function drawLock(ctx, x, y, hot) {
+    ctx.strokeStyle = hot ? '#ffd86b' : '#9aa0ac';
+    ctx.lineWidth = 2;
+    ctx.beginPath();                          // shackle
+    ctx.arc(x + 8, y + 5, 4, Math.PI, 0);
+    ctx.stroke();
+    ctx.fillStyle = hot ? '#ffd86b' : '#9aa0ac';
+    ctx.fillRect(x + 1, y + 6, 14, 10);       // body
+    ctx.fillStyle = hot ? '#5a4410' : '#2a2c33';
+    ctx.fillRect(x + 7, y + 9, 2, 4);         // keyhole
+  }
+
+  function wrapCentered(ctx, text, cx, y, maxW, lineH) {
+    var words = String(text).split(' ');
+    var lines = [], cur = '';
+    for (var i = 0; i < words.length; i++) {
+      var test = cur ? cur + ' ' + words[i] : words[i];
+      if (ctx.measureText(test).width > maxW && cur) {
+        lines.push(cur); cur = words[i];
+      } else {
+        cur = test;
+      }
+    }
+    if (cur) lines.push(cur);
+    if (lines.length > 2) {                    // clamp to two lines
+      lines = [lines[0], lines.slice(1).join(' ')];
+    }
+    for (var j = 0; j < lines.length; j++) {
+      ctx.fillText(lines[j], cx, y + j * lineH);
+    }
+  }
+
+  function fmtTime(s) {
+    var m = Math.floor(s / 60);
+    var sec = Math.floor(s % 60);
+    return (m < 10 ? '0' : '') + m + ':' + (sec < 10 ? '0' : '') + sec;
+  }
+
+  // ---------- go ----------
+  window.addEventListener('load', function () { TD.Game.boot(); });
+
+})(window.TD);

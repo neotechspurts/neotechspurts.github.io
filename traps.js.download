@@ -1,0 +1,636 @@
+/* ============================================================
+   Trap Dungeons 2 - traps.js
+   Every trap is a small state machine built from a declarative
+   definition in levels.js. The Room owns the instances and asks
+   each one to update/draw; traps report kills through ctx.kill()
+   and modify the tile grid through room.setDynamic().
+   ============================================================ */
+'use strict';
+
+(function (TD) {
+
+  var T = TD.TILE;
+
+  function inTrigger(player, trig) {
+    if (!trig) return false;
+    return TD.aabb(player.x, player.y, player.w, player.h,
+      trig.x * T, trig.y * T, trig.w * T, trig.h * T);
+  }
+
+  // Spike hitboxes are inset so pixel-grazes don't feel unfair.
+  function spikeRect(col, row, dirUp) {
+    if (dirUp) return { x: col * T + 5, y: row * T + 18, w: T - 10, h: 14 };
+    return { x: col * T + 5, y: row * T, w: T - 10, h: 14 };
+  }
+
+  function hitsPlayer(p, r) {
+    return TD.aabb(p.x, p.y, p.w, p.h, r.x, r.y, r.w, r.h);
+  }
+
+  // ------------------------------------------------------------
+  var TrapTypes = {};
+
+  // ---- pop-up spikes: erupt from the floor with a short warning
+  TrapTypes.popspike = {
+    init: function (t) { t.state = 'idle'; t.t = 0; t.ext = 0; },
+    update: function (t, dt, ctx) {
+      if (t.state === 'idle' && inTrigger(ctx.player, t.def.trigger)) {
+        t.state = 'warn'; t.t = 0;
+        TD.Audio.trap();
+        t.def.tiles.forEach(function (c) {
+          TD.Particles.spawn(c[0] * T + T / 2, (c[1] + 1) * T, {
+            count: 5, colors: ['#9a8866', '#6b5d45'], vyMin: -90, vyMax: -30
+          });
+        });
+      } else if (t.state === 'warn') {
+        t.t += dt;
+        if (t.t > 0.12) { t.state = 'out'; t.t = 0; }
+      } else if (t.state === 'out') {
+        t.ext = Math.min(1, t.ext + dt / 0.07);
+        if (t.ext > 0.45) {
+          var self = this;
+          t.def.tiles.forEach(function (c) {
+            if (hitsPlayer(ctx.player, spikeRect(c[0], c[1], true))) ctx.kill('spike');
+          });
+        }
+      }
+    },
+    draw: function (t, ctx2d) {
+      if (t.state !== 'out') return;
+      t.def.tiles.forEach(function (c) {
+        var h = Math.round(15 * t.ext);
+        ctx2d.drawImage(TD.GFX.cur.spike, 0, 0, 32, 15,
+          c[0] * T, (c[1] + 1) * T - h - 2, 32, h);
+      });
+    }
+  };
+
+  // ---- ceiling spikes that detach and fall when you pass under
+  TrapTypes.dropspike = {
+    init: function (t, room) {
+      t.units = t.def.tiles.map(function (c) {
+        room.hideStatic(c[0], c[1]);           // we own the rendering now
+        return { col: c[0], x: c[0] * T, y: c[1] * T, vy: 0, state: 'wait' };
+      });
+    },
+    update: function (t, dt, ctx) {
+      var p = ctx.player;
+      t.units.forEach(function (u) {
+        if (u.state === 'wait') {
+          var px = p.x + p.w / 2;
+          if (p.y > u.y && Math.abs(px - (u.x + T / 2)) < (t.def.range || 0.8) * T) {
+            u.state = 'fall';
+            TD.Audio.trap();
+          }
+        } else if (u.state === 'fall') {
+          u.vy += 1700 * dt;
+          u.y += u.vy * dt;
+          if (hitsPlayer(p, { x: u.x + 6, y: u.y + 4, w: T - 12, h: 26 })) ctx.kill('spike');
+          var rowBelow = Math.floor((u.y + 30) / T);
+          if (ctx.room.isSolid(u.col, rowBelow)) {
+            u.y = rowBelow * T - 30;
+            u.state = 'stuck';                 // becomes a floor hazard
+            TD.Shake.hit(2, 0.15);
+            TD.Particles.spawn(u.x + T / 2, u.y + 30, { count: 4, colors: ['#cfd2da'] });
+          }
+        } else { // stuck: still deadly, points up-ish on the ground
+          if (hitsPlayer(p, { x: u.x + 6, y: u.y + 10, w: T - 12, h: 20 })) ctx.kill('spike');
+        }
+      });
+    },
+    draw: function (t, ctx2d) {
+      t.units.forEach(function (u) {
+        // draw the hanging/falling spike (down-pointing = flipped)
+        ctx2d.save();
+        ctx2d.translate(u.x + 16, u.y + 15);
+        ctx2d.scale(1, -1);
+        ctx2d.drawImage(TD.GFX.cur.spike, -16, -15 + (u.state === 'stuck' ? -15 : 0));
+        ctx2d.restore();
+      });
+    }
+  };
+
+  // ---- a brick that drops from above and becomes part of the level
+  TrapTypes.fallblock = {
+    init: function (t) {
+      t.units = t.def.tiles.map(function (c) {
+        return { col: c[0], landRow: c[1], x: c[0] * T, y: -T * 1.5, vy: 0, state: 'wait' };
+      });
+      t.fired = false;
+    },
+    update: function (t, dt, ctx) {
+      if (!t.fired && inTrigger(ctx.player, t.def.trigger)) {
+        t.fired = true;
+        t.units.forEach(function (u) { u.state = 'fall'; });
+        TD.Audio.trap();
+      }
+      t.units.forEach(function (u) {
+        if (u.state !== 'fall') return;
+        u.vy += 2000 * dt;
+        u.y += u.vy * dt;
+        if (hitsPlayer(ctx.player, { x: u.x + 2, y: u.y, w: T - 4, h: T })) ctx.kill('crushed');
+        var target = u.landRow * T;
+        if (u.y >= target) {
+          u.y = target;
+          u.state = 'landed';
+          ctx.room.setDynamic(u.col, u.landRow, true);   // now solid
+          TD.Shake.hit(4, 0.25);
+          TD.Audio.crumble();
+          TD.Particles.spawn(u.x + T / 2, u.y + T, { count: 10, colors: ['#9a8866', '#6b5d45'] });
+        }
+      });
+    },
+    draw: function (t, ctx2d) {
+      t.units.forEach(function (u) {
+        if (u.state === 'wait') return;
+        ctx2d.drawImage(TD.GFX.cur.ground, Math.round(u.x), Math.round(u.y), T, T);
+      });
+    }
+  };
+
+  // ---- crusher: a block column that slams down and retracts
+  TrapTypes.crusher = {
+    init: function (t) {
+      t.state = t.def.periodic ? 'cool' : 'idle';
+      t.t = t.def.periodic ? (t.def.phase || 0) : 0;
+      t.x = t.def.col * T;
+      t.homeY = t.def.homeRow * T;
+      t.y = t.homeY;
+      t.hPx = t.def.h * T;
+      t.slamY = t.def.floorRow * T - t.hPx;
+    },
+    update: function (t, dt, ctx) {
+      var def = t.def;
+      switch (t.state) {
+        case 'idle':
+          if (inTrigger(ctx.player, def.trigger)) { t.state = 'slam'; TD.Audio.trap(); }
+          break;
+        case 'cool':
+          t.t += dt;
+          if (t.t >= def.periodic) { t.t = 0; t.state = 'slam'; }
+          break;
+        case 'slam':
+          t.y += 760 * dt;
+          if (t.y >= t.slamY) {
+            t.y = t.slamY;
+            t.state = 'rest'; t.t = 0;
+            TD.Shake.hit(3, 0.2);
+            TD.Audio.crumble();
+            TD.Particles.spawn(t.x + T / 2, t.y + t.hPx, { count: 6, colors: ['#9a8866'] });
+          }
+          break;
+        case 'rest':
+          t.t += dt;
+          if (t.t > 0.45) t.state = 'rise';
+          break;
+        case 'rise':
+          t.y -= 110 * dt;
+          if (t.y <= t.homeY) {
+            t.y = t.homeY;
+            t.state = def.periodic ? 'cool' : 'idle';
+            t.t = 0;
+          }
+          break;
+      }
+      // deadly while moving or resting low
+      if (t.state !== 'idle' && t.state !== 'cool') {
+        if (hitsPlayer(ctx.player, { x: t.x + 3, y: t.y + 4, w: T - 6, h: t.hPx - 4 })) {
+          ctx.kill('crushed');
+        }
+      }
+    },
+    draw: function (t, ctx2d) {
+      for (var i = 0; i < t.def.h; i++) {
+        ctx2d.drawImage(TD.GFX.cur.ground, Math.round(t.x), Math.round(t.y + i * T), T, T);
+      }
+      // spiky underside hint
+      ctx2d.save();
+      ctx2d.translate(t.x + 16, t.y + t.hPx + 7);
+      ctx2d.scale(1, -1);
+      ctx2d.globalAlpha = 0.9;
+      ctx2d.drawImage(TD.GFX.cur.spike, -16, -7, 32, 9);
+      ctx2d.restore();
+      ctx2d.globalAlpha = 1;
+    }
+  };
+
+  // ---- arrow shooter
+  TrapTypes.arrow = {
+    init: function (t) { t.fired = false; t.arrow = null; t.t = 0; },
+    update: function (t, dt, ctx) {
+      var def = t.def;
+      if (!t.fired && inTrigger(ctx.player, def.trigger)) {
+        t.fired = true;
+        t.t = -(def.delay || 0);
+      }
+      if (t.fired && !t.arrow) {
+        t.t += dt;
+        if (t.t >= 0) {
+          var dir = def.dir === 'left' ? -1 : 1;
+          t.arrow = {
+            x: def.from[0] * T + (dir === -1 ? -6 : T - 8),
+            y: def.from[1] * T + T / 2 - 2,
+            vx: 270 * dir, dir: dir
+          };
+          TD.Audio.trap();
+        }
+      }
+      var a = t.arrow;
+      if (a) {
+        a.x += a.vx * dt;
+        if (hitsPlayer(ctx.player, { x: a.x, y: a.y - 1, w: 14, h: 6 })) ctx.kill('arrow');
+        var col = Math.floor((a.x + (a.dir === 1 ? 14 : 0)) / T);
+        var row = Math.floor((a.y + 2) / T);
+        if (a.x < -20 || a.x > TD.VIEW_W + 20 || ctx.room.isSolid(col, row)) {
+          if (ctx.room.isSolid(col, row)) {
+            TD.Particles.spawn(a.x + 7, a.y + 2, { count: 3, colors: ['#d8c878'] });
+          }
+          t.arrow = null;
+          t.fired = false;   // re-armable
+          t.t = 0;
+        }
+      }
+    },
+    draw: function (t, ctx2d) {
+      var a = t.arrow;
+      if (!a) return;
+      ctx2d.fillStyle = '#d8c878';
+      ctx2d.fillRect(Math.round(a.x), Math.round(a.y), 14, 3);
+      ctx2d.fillStyle = '#fff2b0';
+      var tipX = a.dir === 1 ? a.x + 14 : a.x - 3;
+      ctx2d.fillRect(Math.round(tipX), Math.round(a.y - 1), 3, 5);
+    }
+  };
+
+  // ---- ghost block: appears mid-air, then stays for the room visit
+  TrapTypes.ghostblock = {
+    init: function (t, room, memory) {
+      t.shown = !!(t.def.persist && memory[t.memKey()]);
+      if (t.shown) this._solidify(t, room);
+      t.flash = 0;
+    },
+    _solidify: function (t, room) {
+      t.def.tiles.forEach(function (c) { room.setDynamic(c[0], c[1], true); });
+    },
+    update: function (t, dt, ctx) {
+      t.flash = Math.max(0, t.flash - dt);
+      if (!t.shown && inTrigger(ctx.player, t.def.trigger)) {
+        t.shown = true;
+        t.flash = 0.3;
+        this._solidify(t, ctx.room);
+        if (t.def.persist) ctx.memory[t.memKey()] = true;
+        TD.Audio.troll();
+        TD.Shake.hit(2, 0.15);
+        // push the player out if they overlap the new block
+        ctx.room.ejectPlayer(ctx.player, t.def.tiles);
+      }
+    },
+    draw: function (t, ctx2d) {
+      if (!t.shown) return;
+      t.def.tiles.forEach(function (c) {
+        ctx2d.drawImage(TD.GFX.cur.ground, c[0] * T, c[1] * T, T, T);
+        if (t.flash > 0) {
+          ctx2d.globalAlpha = t.flash * 2.5;
+          ctx2d.fillStyle = '#ffffff';
+          ctx2d.fillRect(c[0] * T, c[1] * T, T, T);
+          ctx2d.globalAlpha = 1;
+        }
+      });
+    }
+  };
+  TrapTypes.ghostblock.initNeedsMemory = true;
+
+  // ---- vanish tiles: solid until stood on, then gone
+  TrapTypes.vanish = {
+    init: function (t, room) {
+      t.units = t.def.tiles.map(function (c) {
+        room.setDynamic(c[0], c[1], true);
+        return { col: c[0], row: c[1], state: 'solid', t: 0 };
+      });
+    },
+    update: function (t, dt, ctx) {
+      var p = ctx.player;
+      t.units.forEach(function (u) {
+        if (u.state === 'solid') {
+          var standing = p.onGround &&
+            Math.abs((p.y + p.h) - u.row * T) < 2 &&
+            p.x + p.w > u.col * T + 2 && p.x < (u.col + 1) * T - 2;
+          if (standing) { u.state = 'shake'; u.t = 0; TD.Audio.crumble(); }
+        } else if (u.state === 'shake') {
+          u.t += dt;
+          if (u.t > 0.18) {
+            u.state = 'gone';
+            ctx.room.setDynamic(u.col, u.row, false);
+            TD.Particles.spawn(u.col * T + T / 2, u.row * T + T / 2,
+              { count: 8, colors: ['#9a8866', '#6b5d45'] });
+          }
+        }
+      });
+    },
+    draw: function (t, ctx2d) {
+      t.units.forEach(function (u) {
+        if (u.state === 'gone') return;
+        var ox = u.state === 'shake' ? TD.rand(-1.5, 1.5) : 0;
+        ctx2d.drawImage(TD.GFX.cur.ground, Math.round(u.col * T + ox), u.row * T, T, T);
+      });
+    }
+  };
+
+  // ---- fake door: the exit you deserve, not the one you need
+  TrapTypes.fakedoor = {
+    init: function (t, room, memory) {
+      t.sprung = !!memory[t.memKey()];
+      t.spikeT = t.sprung ? 1 : 0;
+    },
+    update: function (t, dt, ctx) {
+      var c = t.def.at;
+      if (!t.sprung) {
+        if (hitsPlayer(ctx.player, { x: c[0] * T + 4, y: c[1] * T + 2, w: T - 8, h: T - 2 })) {
+          t.sprung = true;
+          ctx.memory[t.memKey()] = true;
+          TD.Audio.troll();
+          TD.Shake.hit(3, 0.25);
+          if (t.def.reveal) ctx.room.addDoor(t.def.reveal[0], t.def.reveal[1]);
+          ctx.kill('lies');           // the door itself bites
+        }
+      } else {
+        t.spikeT = Math.min(1, t.spikeT + dt / 0.07);
+        if (t.spikeT > 0.4 &&
+            hitsPlayer(ctx.player, spikeRect(c[0], c[1], true))) {
+          ctx.kill('spike');
+        }
+      }
+    },
+    draw: function (t, ctx2d) {
+      var c = t.def.at;
+      if (!t.sprung) {
+        ctx2d._drawDoor(c[0], c[1], true);
+      } else {
+        var h = Math.round(15 * t.spikeT);
+        ctx2d.drawImage(TD.GFX.cur.spike, 0, 0, 32, 15,
+          c[0] * T, (c[1] + 1) * T - h - 2, 32, h);
+      }
+    }
+  };
+
+  // ---- movedoor: a door that flees when you get close.
+  // Looks pixel-identical to a real exit. Within ~1.25 tiles it
+  // vanishes with a puff and the REAL door appears somewhere far
+  // (persisted, so next lives start with the truth on display).
+  TrapTypes.movedoor = {
+    init: function (t, room, memory) {
+      t.moved = !!memory[t.memKey()];
+    },
+    update: function (t, dt, ctx) {
+      if (t.moved) return;
+      var c = t.def.at;
+      if (hitsPlayer(ctx.player,
+          { x: c[0] * T - 40, y: c[1] * T - 16, w: T + 80, h: T + 24 })) {
+        t.moved = true;
+        ctx.memory[t.memKey()] = true;
+        ctx.room.addDoor(t.def.to[0], t.def.to[1]);
+        TD.Audio.troll();
+        TD.Shake.hit(2, 0.2);
+        TD.Particles.spawn(c[0] * T + 16, c[1] * T + 18, {
+          count: 14, colors: ['#5a3a1e', '#caa84a', '#9a6228'],
+          vyMin: -160, vyMax: -30
+        });
+      }
+    },
+    draw: function (t, ctx2d) {
+      if (!t.moved) ctx2d._drawDoor(t.def.at[0], t.def.at[1], false, 0);
+    }
+  };
+
+  // ---- trapheart: bait that bites. Drawn exactly like a real
+  // pickup, same bob, same sprite. Touching it is a death. It
+  // re-arms every life: the lesson lives in the player, not in
+  // the room.
+  TrapTypes.trapheart = {
+    init: function (t) {
+      t.seed = (t.def.at[0] * 7 + t.def.at[1] * 13) % 6;
+    },
+    update: function (t, dt, ctx) {
+      var c = t.def.at;
+      if (hitsPlayer(ctx.player,
+          { x: c[0] * T + 8, y: c[1] * T + 8, w: 16, h: 16 })) {
+        TD.Audio.troll();
+        TD.Particles.spawn(c[0] * T + 16, c[1] * T + 16, {
+          count: 12, colors: ['#e8485c', '#8a1626'], vyMin: -180, vyMax: -40
+        });
+        ctx.kill('trollheart');
+      }
+    },
+    draw: function (t, ctx2d) {
+      var c = t.def.at;
+      var bob = Math.sin((TD.Game.gt + t.seed) * 4) * 2;
+      ctx2d.drawImage(TD.Assets.img.heart,
+        c[0] * T + 7, Math.round(c[1] * T + 7 + bob), 18, 18);
+    }
+  };
+
+  // ---- fakespring: all plate, no coil. Drawn exactly like a
+  // normal spring and does absolutely nothing when stepped on.
+  TrapTypes.fakespring = {
+    init: function (t) {},
+    update: function (t, dt, ctx) {},
+    draw: function (t, ctx2d) {
+      var sx = t.def.at[0] * T, sy = t.def.at[1] * T;
+      ctx2d.fillStyle = '#555a66';
+      ctx2d.fillRect(sx + 8, sy + 22, 16, 8);
+      ctx2d.fillStyle = '#8a90a0';
+      ctx2d.fillRect(sx + 10, sy + 24, 12, 2);
+      ctx2d.fillStyle = '#c2453a';
+      ctx2d.fillRect(sx + 4, sy + 16, 24, 6);
+    }
+  };
+
+  // ---- jumpspikes: the room punishes instinct. Starting a JUMP
+  // while inside the zone pops spikes out for the rest of this
+  // life. Walking through is perfectly safe. Spring launches are
+  // exempt (their velocity is beyond a manual jump).
+  TrapTypes.jumpspikes = {
+    init: function (t) {
+      t.fired = false;
+      t.ext = 0;
+      t.pg = true;
+    },
+    update: function (t, dt, ctx) {
+      var p = ctx.player;
+      if (!t.fired) {
+        var jumped = t.pg && !p.onGround && p.vy < -150 && p.vy > -550;
+        if (jumped && inTrigger(p, t.def.zone)) {
+          t.fired = true;
+          TD.Audio.trap();
+          TD.Shake.hit(2, 0.18);
+        }
+        t.pg = p.onGround;
+        return;
+      }
+      t.ext = Math.min(1, t.ext + dt / 0.14);
+      if (t.ext > 0.45) {
+        for (var i = 0; i < t.def.tiles.length; i++) {
+          var cell = t.def.tiles[i];
+          if (hitsPlayer(p, spikeRect(cell[0], cell[1], true))) {
+            ctx.kill('spike');
+            return;
+          }
+        }
+      }
+    },
+    draw: function (t, ctx2d) {
+      if (!t.fired) return;
+      var h = Math.round(15 * t.ext);
+      for (var i = 0; i < t.def.tiles.length; i++) {
+        var cell = t.def.tiles[i];
+        ctx2d.drawImage(TD.GFX.cur.spike, 0, 0, 32, 15,
+          cell[0] * T, (cell[1] + 1) * T - h, 32, h);
+      }
+    }
+  };
+
+  // ---- spinner: a platform that looks ordinary until you land on
+  // it. Then, by surprise, it starts flipping like a coin. It stays
+  // solid while face-on and turns INTANGIBLE for a brief moment each
+  // time it goes edge-on, so lingering drops you into the pit. The
+  // phase resets to face-on the instant you land, so there is always
+  // a fair solid window to jump off toward the door. Re-arms on death.
+  TrapTypes.spinner = {
+    init: function (t, room) {
+      t.active = false;
+      t.ang = 0;
+      room.setDynamic(t.def.at[0], t.def.at[1], true);   // solid to begin with
+    },
+    update: function (t, dt, ctx) {
+      var c = t.def.at, p = ctx.player;
+      var bx = c[0] * T, by = c[1] * T;
+
+      if (!t.active) {
+        // standing on top: feet at the block's top edge, overlapping x
+        var feet = p.y + p.h;
+        var onTop = p.vy >= 0 &&
+          Math.abs(feet - by) < 6 &&
+          p.x + p.w > bx + 3 && p.x < bx + T - 3;
+        if (onTop) {
+          t.active = true;
+          t.ang = 0;                       // fresh face-on window
+          TD.Audio.trap();
+          TD.Shake.hit(2, 0.18);
+        }
+        return;
+      }
+
+      t.ang += dt * 1.9;                    // ~3.3s per full turn
+      var solid = Math.abs(Math.cos(t.ang)) > 0.34;   // edge-on => intangible
+      ctx.room.setDynamic(c[0], c[1], solid);
+    },
+    draw: function (t, ctx2d) {
+      var c = t.def.at, bx = c[0] * T, by = c[1] * T;
+      var sx = t.active ? Math.max(0.14, Math.abs(Math.cos(t.ang))) : 1;
+      ctx2d.save();
+      ctx2d.translate(bx + T / 2, by + T / 2);
+      ctx2d.scale(sx, 1);
+      ctx2d.drawImage(TD.GFX.cur.ground, -T / 2, -T / 2, T, T);
+      ctx2d.restore();
+      if (t.active && sx < 0.4) {           // bright edge when turning thin
+        ctx2d.fillStyle = 'rgba(255,230,140,0.8)';
+        ctx2d.fillRect(bx + T / 2 - 1, by + 2, 2, T - 4);
+      }
+    }
+  };
+
+  // ---- chaser: spiked wall sweeping the room
+  // ---- tracker: a hovering spike that mirrors your steps.
+  // Faithful port of hiddenSpike2 from the original Level 2:
+  // appears on trigger ahead of the player, eases up into place,
+  // then follows the player horizontally inside a clamped strip.
+  // The intended counter is one long, early jump over the strip.
+  TrapTypes.tracker = {
+    init: function (t) {
+      t.active = false;
+      t.x = t.def.clamp[0] * T;
+      t.y = t.def.y * T + 20;
+    },
+    update: function (t, dt, ctx) {
+      if (!t.active) {
+        if (inTrigger(ctx.player, t.def.trigger)) {
+          t.active = true;
+          TD.Audio.trap();
+        }
+        return;
+      }
+      // ease up to hover height, then mirror the player's x
+      t.y += (t.def.y * T - t.y) * Math.min(1, dt * 14);
+      var px = ctx.player.x + ctx.player.w / 2;
+      t.x = TD.clamp(px, t.def.clamp[0] * T, t.def.clamp[1] * T);
+      if (hitsPlayer(ctx.player, { x: t.x - 11, y: t.y - 6, w: 22, h: 12 })) {
+        ctx.kill('tracker');
+      }
+    },
+    draw: function (t, ctx) {
+      if (!t.active) return;
+      var img = TD.GFX.cur.spike;
+      ctx.drawImage(img, 0, 0, 32, 15,
+        Math.round(t.x - 16), Math.round(t.y - 7.5), 32, 15);
+    }
+  };
+
+  TrapTypes.chaser = {
+    init: function (t) {
+      t.x = -T * 1.2;
+      t.t = 0;
+      t.started = false;
+      t.topRow = t.def.rows[0];
+      t.botRow = t.def.rows[1];
+    },
+    update: function (t, dt, ctx) {
+      t.t += dt;
+      if (!t.started) {
+        if (t.t >= (t.def.delay || 0.6)) {
+          t.started = true;
+          TD.Audio.trap();
+          TD.Shake.hit(2, 0.2);
+        }
+        return;
+      }
+      t.x += t.def.speed * dt;
+      var hPx = (t.botRow - t.topRow + 1) * T;
+      if (hitsPlayer(ctx.player,
+          { x: t.x, y: t.topRow * T, w: T + 10, h: hPx })) {
+        ctx.kill('chaser');
+      }
+    },
+    draw: function (t, ctx2d) {
+      if (t.x < -T) return;
+      var x = Math.round(t.x);
+      for (var r = t.topRow; r <= t.botRow; r++) {
+        ctx2d.drawImage(TD.GFX.cur.ground, x, r * T, T, T);
+        // spikes on the leading face
+        ctx2d.save();
+        ctx2d.translate(x + T + 7, r * T + 16);
+        ctx2d.rotate(Math.PI / 2);
+        ctx2d.drawImage(TD.GFX.cur.spike, -16, -7, 32, 14);
+        ctx2d.restore();
+      }
+    }
+  };
+
+  // ------------------------------------------------------------
+  TD.createTrap = function (def, index) {
+    var impl = TrapTypes[def.type];
+    if (!impl) throw new Error('Unknown trap type: ' + def.type);
+    var t = {
+      def: def,
+      impl: impl,
+      memKey: function () { return def.type + '#' + index; },
+      update: function (dt, ctx) { impl.update(t, dt, ctx); },
+      draw: function (ctx2d) { impl.draw(t, ctx2d); }
+    };
+    return t;
+  };
+
+  TD.initTrap = function (t, room, memory) {
+    t.impl.init(t, room, memory);
+  };
+
+})(window.TD);

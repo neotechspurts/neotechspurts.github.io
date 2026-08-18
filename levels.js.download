@@ -1,0 +1,618 @@
+/* ============================================================
+   Trap Dungeons 2 - levels.js
+   Data-driven level definitions. Each room is a 15x10 ASCII
+   map plus a declarative list of traps. Compare with v1 where
+   every level was a Phaser scene full of nested skip-conditions:
+   here adding a room means adding data, not code.
+
+   Map legend
+     #  solid brick            =  half brick (solid)
+     .  empty                  ~  FAKE brick (looks solid, isn't)
+     c  crumble brick          ^  spikes pointing up (deadly)
+     v  spikes hanging down    x  FAKE spikes (look deadly, aren't)
+     s  spring                 S  mega spring
+     h  heart pickup           P  player spawn
+     D  exit door
+
+   Trap triggers use tile units ({x,y,w,h} rectangles).
+   All twelve rooms are original layouts built on the classic
+   trap-platformer vocabulary: pop-up spikes, crumbling floors,
+   lying doors, ghost blocks, crushers and one final gag.
+   ============================================================ */
+'use strict';
+
+(function (TD) {
+
+  TD.LEVELS = [
+
+    // ============================================================
+    // Atto classico: i tre livelli originali di Trap Dungeons 2,
+    // portati 1:1 dalla build Phaser (clancyplay). Unico ritocco:
+    // una tile in piu' sul bordo sinistro della piattaforma destra
+    // del Classico 2, perche' il salto di questo motore e' meno
+    // fluttuante di quello Phaser (gravita' 1500 vs 1200).
+    // ============================================================
+    // ---------------------------------------------------- 1
+    {
+      name: { it: 'Classico 1', en: 'Classic 1' },
+      tip:  { it: 'Il primissimo livello. Goditelo.', en: 'The very first level. Enjoy it.' },
+      map: [
+        '##.P###########',
+        '##..###########',
+        '##..###########',
+        '##..###########',
+        '##..###########',
+        '##.............',
+        '##.............',
+        '##............D',
+        '###############',
+        '###############'
+      ],
+      traps: []
+    },
+
+    // ---------------------------------------------------- 2
+    {
+      name: { it: 'Classico 2', en: 'Classic 2' },
+      tip:  { it: 'Il terzo gradino ha cambiato idea.', en: 'The third step changed its mind.' },
+      map: [
+        '###############',
+        '####...........',
+        '####...........',
+        '####...........',
+        '.........#....D',
+        '.......#..#####',
+        'P....#.....####',
+        '####.......####',
+        '####^^^^^^^####',
+        '###############'
+      ],
+      traps: [
+        { type: 'popspike', tiles: [[9, 3]],
+          trigger: { x: 8.6, y: 2.8, w: 0.45, h: 3.1 } },
+        { type: 'tracker', y: 4.7, clamp: [12.3, 13.4],
+          trigger: { x: 10.9, y: 4.8, w: 1, h: 1.4 } }
+      ]
+    },
+
+    // ---------------------------------------------------- 3
+    {
+      name: { it: 'Classico 3', en: 'Classic 3' },
+      tip:  { it: 'La vittoria sta in alto. Occhio agli appoggi.', en: 'Victory hangs above. Mind your footing.' },
+      map: [
+        '###############',
+        '...............',
+        '...............',
+        '......D........',
+        '.P.............',
+        '####...#...####',
+        '####.......####',
+        '####.......####',
+        '####.......####',
+        '####^^^^^^^####'
+      ],
+      traps: [
+        { type: 'spinner', at: [5, 5] }
+      ]
+    },
+
+// ---------------------------------------------------- 4
+    {
+      name: { it: 'Benvenuto', en: 'Welcome' },
+      tip:  { it: 'Rilassati, e\u0300 una passeggiata. Quasi.', en: 'Relax, it is a stroll. Almost.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#......h......#',
+        '#.............#',
+        '#P.....^^....D#',
+        '###############',
+        '###############'
+      ],
+      traps: []
+    },
+
+// ---------------------------------------------------- 5
+    {
+      name: { it: 'Il pavimento mente', en: 'The floor lies' },
+      tip:  { it: 'Alcuni mattoni sono piu\u0300 onesti di altri.', en: 'Some bricks are more honest than others.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#.......h.....#',
+        '#P...........D#',
+        '###cc###~~#####',
+        '#.............#',
+        '#.............#',
+        '#^^^^^^^^^^^^^#',
+        '###############'
+      ],
+      traps: []
+    },
+
+    // ---------------------------------------------------- 6
+    {
+      name: { it: 'Pioggia', en: 'Rain' },
+      tip:  { it: 'Sotto la pioggia si cammina. Non saltare.', en: 'In the rain, you walk. Do not jump.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#....v.v.v....#',
+        '#.............#',
+        '#.............#',
+        '#......h......#',
+        '#P.x.x.x.x.x.D#',
+        '###############',
+        '###############'
+      ],
+      traps: [
+        { type: 'jumpspikes', zone: { x: 1, y: 5.5, w: 13, h: 2.5 },
+          tiles: [[3, 6], [7, 6], [11, 6]] }
+      ]
+    },
+
+// ---------------------------------------------------- 7
+    {
+      name: { it: 'Su!', en: 'Up!' },
+      tip:  { it: 'Le molle grandi sono le migliori. Fidati.', en: 'Big springs are the best ones. Trust me.' },
+      map: [
+        '###############',
+        '#...v.........#',
+        '#.h.........D.#',
+        '#.........###.#',
+        '#.......=.....#',
+        '#.....=.......#',
+        '#...=.........#',
+        '#P..S.........#',
+        '###############',
+        '###############'
+      ],
+      traps: []
+    },
+
+// ---------------------------------------------------- 8
+    {
+      name: { it: 'Frecce', en: 'Arrows' },
+      tip:  { it: 'Non tutti i cuori battono per te.', en: 'Not every heart beats for you.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#..........D..#',
+        '#........==...#',
+        '#......==.....#',
+        '#....==.......#',
+        '#..==.........#',
+        '#P............#',
+        '###############',
+        '###############'
+      ],
+      traps: [
+        { type: 'arrow', from: [14, 7], dir: 'left',
+          trigger: { x: 2, y: 6.4, w: 4, h: 1.4 } },
+        { type: 'arrow', from: [0, 7], dir: 'right', delay: 0.5,
+          trigger: { x: 5, y: 6.4, w: 4, h: 1.4 } },
+        { type: 'trapheart', at: [9, 3] }
+      ]
+    },
+
+// ---------------------------------------------------- 9
+    {
+      name: { it: 'La pressa', en: 'The press' },
+      tip:  { it: 'Il soffitto ha fretta. Aspetta il momento.', en: 'The ceiling is in a hurry. Wait for the gap.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#P...........D#',
+        '###############',
+        '###############'
+      ],
+      traps: [
+        { type: 'crusher', col: 4,  homeRow: 1, h: 2, floorRow: 8, periodic: 1.9, phase: 0.0 },
+        { type: 'crusher', col: 8,  homeRow: 1, h: 2, floorRow: 8, periodic: 1.9, phase: 1.2 },
+        { type: 'crusher', col: 11, homeRow: 1, h: 2, floorRow: 8, periodic: 1.9, phase: 0.4 }
+      ]
+    },
+
+// ---------------------------------------------------- 10
+    {
+      name: { it: 'Il muro fantasma', en: 'The ghost wall' },
+      tip:  { it: 'Quel cuore sembra proprio gratis.', en: 'That heart looks awfully free.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#.....h.......#',
+        '#P...........D#',
+        '#####...##...##',
+        '#.............#',
+        '#.............#',
+        '#....^^^.^^^^.#',
+        '###############'
+      ],
+      traps: [
+        { type: 'ghostblock', tiles: [[6, 5]], persist: true,
+          trigger: { x: 3.4, y: 3, w: 1, h: 2 } },
+        { type: 'vanish', tiles: [[10, 5], [11, 5], [12, 5]] }
+      ]
+    },
+
+    // ---------------------------------------------------- 11
+    {
+      name: { it: 'Scale bugiarde', en: 'Lying stairs' },
+      tip:  { it: 'Un gradino su due ha cambiato lavoro.', en: 'Every other step changed careers.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#............D#',
+        '#....h.....####',
+        '#.........c...#',
+        '#.......#.....#',
+        '#.....c.......#',
+        '#P..#.........#',
+        '#####^^^^^^^^##',
+        '###############'
+      ],
+      traps: [
+        { type: 'arrow', from: [0, 4], dir: 'right',
+          trigger: { x: 5.4, y: 5, w: 1.2, h: 1.6 } },
+        { type: 'popspike', tiles: [[12, 2]],
+          trigger: { x: 11.2, y: 1, w: 0.8, h: 2.5 } }
+      ]
+    },
+
+    // ---------------------------------------------------- 12
+    {
+      name: { it: 'La porta sbagliata', en: 'The wrong door' },
+      tip:  { it: 'Una porta cosi\u0300 comoda. Cosa potrebbe andare storto?', en: 'Such a convenient door. What could go wrong?' },
+      map: [
+        '###############',
+        '#.............#',
+        '#..........D..#',
+        '#........==...#',
+        '#......==.....#',
+        '#....==.......#',
+        '#..==.........#',
+        '#P............#',
+        '###############',
+        '###############'
+      ],
+      traps: [
+        { type: 'fakespring', at: [10, 7] },
+        { type: 'trapheart', at: [5, 5] }
+      ]
+    },
+
+// ---------------------------------------------------- 13
+    {
+      name: { it: 'Tutto insieme', en: 'All at once' },
+      tip:  { it: 'Ripasso generale. In bocca al lupo.', en: 'Final review. Good luck.' },
+      map: [
+        '###############',
+        '#............v#',
+        '#.............#',
+        '#........h....#',
+        '#P...........D#',
+        '###ccc###..####',
+        '#.............#',
+        '#.............#',
+        '#^^^^^^^^^^^^^#',
+        '###############'
+      ],
+      traps: [
+        { type: 'crusher', col: 7, homeRow: 1, h: 2, floorRow: 5,
+          trigger: { x: 6.2, y: 3, w: 1.6, h: 2 } },
+        { type: 'popspike', tiles: [[12, 4]],
+          trigger: { x: 10.6, y: 2.5, w: 0.9, h: 2.5 } },
+        { type: 'dropspike', tiles: [[13, 1]], range: 0.9 }
+      ]
+    },
+
+    // ---------------------------------------------------- 14
+    {
+      name: { it: 'Maratona', en: 'Marathon' },
+      tip:  { it: 'Corri. Non voltarti. Ok, voltati pure.', en: 'Run. Don\u2019t look back. Fine, look back.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#......h......#',
+        '#.............#',
+        '#P...^...^...D#',
+        '###############',
+        '###############'
+      ],
+      traps: [
+        { type: 'chaser', rows: [5, 7], speed: 100, delay: 0.7 }
+      ]
+    },
+
+    // ---------------------------------------------------- 15
+    {
+      name: { it: 'Doppio salto', en: 'Double gap' },
+      tip:  { it: 'Due vuoti, nessuna fretta.', en: 'Two gaps, no rush.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#......h......#',
+        '#.............#',
+        '#P...^^...^^.D#',
+        '###############',
+        '###############'
+      ],
+      traps: []
+    },
+
+// ---------------------------------------------------- 16
+    {
+      name: { it: 'Ascensore', en: 'Going up' },
+      tip:  { it: 'Sali. Non fermarti sotto il temporale.', en: 'Climb. Never stop under the storm.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#..........D..#',
+        '#........==...#',
+        '#......==.....#',
+        '#....==.......#',
+        '#..==.........#',
+        '#P............#',
+        '###############',
+        '###############'
+      ],
+      traps: [
+        { type: 'crusher', col: 6, homeRow: 0, h: 1, floorRow: 4, periodic: 1.5, phase: 0.0 }
+      ]
+    },
+
+// ---------------------------------------------------- 17
+    {
+      name: { it: 'Ping pong', en: 'Ping pong' },
+      tip:  { it: 'Qualche mattone sembra piu sano degli altri.', en: 'Some bricks look healthier than the rest.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#......h......#',
+        '#.............#',
+        '#P...........D#',
+        '##ccc~ccc~ccc##',
+        '#.............#',
+        '#.............#',
+        '#^^^^^^^^^^^^^#',
+        '###############'
+      ],
+      traps: [
+        { type: 'arrow', from: [14, 4], dir: 'left',
+          trigger: { x: 3.4, y: 3, w: 0.8, h: 2 } },
+        { type: 'arrow', from: [0, 4], dir: 'right', delay: 0.2,
+          trigger: { x: 6.4, y: 3, w: 0.8, h: 2 } },
+        { type: 'arrow', from: [14, 4], dir: 'left',
+          trigger: { x: 9.4, y: 3, w: 0.8, h: 2 } }
+      ]
+    },
+
+    // ---------------------------------------------------- 18
+    {
+      name: { it: 'Pressione', en: 'Pressure' },
+      tip:  { it: 'Il muro non aspetta.', en: 'The wall won\u2019t wait.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#......h......#',
+        '#.............#',
+        '#P...^....^..D#',
+        '###############',
+        '###############'
+      ],
+      traps: [
+        { type: 'crusher', col: 3,  homeRow: 1, h: 4, floorRow: 8, periodic: 1.5 },
+        { type: 'crusher', col: 7,  homeRow: 1, h: 4, floorRow: 8,
+          trigger: { x: 5.8, y: 4, w: 1, h: 4 } },
+        { type: 'crusher', col: 11, homeRow: 1, h: 4, floorRow: 8, periodic: 1.9 },
+        { type: 'chaser', rows: [5, 7], speed: 106, delay: 0.8 }
+      ]
+    },
+
+    // ---------------------------------------------------- 19
+    {
+      name: { it: 'Vola basso', en: 'Fly low' },
+      tip:  { it: 'L\u2019umilta\u0300 paga.', en: 'Humility pays.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.....h.......#',
+        '#........#....#',
+        '#P..s....~...D#',
+        '###############',
+        '###############'
+      ],
+      traps: [
+        { type: 'jumpspikes', zone: { x: 1, y: 6, w: 12.5, h: 2 },
+          tiles: [[3, 5], [7, 5], [11, 5]] },
+        { type: 'popspike', tiles: [[10, 7], [11, 7], [12, 7]],
+          trigger: { x: 9.5, y: 3, w: 3, h: 2 } }
+      ]
+    },
+
+    // ---------------------------------------------------- 20
+    {
+      name: { it: 'Esame finale', en: 'Final exam' },
+      tip:  { it: 'La porta vicina mente. Corri.', en: 'The near door lies. Run.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#......h......#',
+        '#.............#',
+        '#....ccccc....#',
+        '#..##.....##..#',
+        '#P...........D#',
+        '###############',
+        '###############'
+      ],
+      traps: [
+        { type: 'fakedoor', at: [7, 7] },
+        { type: 'trapheart', at: [9, 2] },
+        { type: 'chaser', rows: [3, 7], speed: 108, delay: 0.9 }
+      ]
+    },
+
+    // ---------------------------------------------------- 21
+    {
+      name: { it: 'Gemelli', en: 'Twins' },
+      tip:  { it: 'Ti conoscono bene. Salta i loro territori.', en: 'They know your moves. Jump their turf.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#P.........D..#',
+        '###############',
+        '###############'
+      ],
+      traps: [
+        { type: 'tracker', y: 7.4, clamp: [4.0, 5.0],
+          trigger: { x: 2.5, y: 6, w: 2, h: 2 } },
+        { type: 'tracker', y: 7.4, clamp: [7.0, 8.0],
+          trigger: { x: 5.5, y: 6, w: 2, h: 2 } }
+      ]
+    },
+
+// ---------------------------------------------------- 22
+    {
+      name: { it: 'La cantina', en: 'The cellar' },
+      tip:  { it: 'Una bugia dice il vero.', en: 'One lie tells the truth.' },
+      map: [
+        '###############',
+        '#P............#',
+        '###~~##~~###..#',
+        '#.............#',
+        '#.............#',
+        '#........h....#',
+        '#.............#',
+        '#......D......#',
+        '###^^#######^^#',
+        '###############'
+      ],
+      traps: []
+    },
+
+    // ---------------------------------------------------- 23
+    {
+      name: { it: 'Ultimo avviso', en: 'Last warning' },
+      tip:  { it: 'Quasi. Non ancora.', en: 'Almost. Not yet.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#......h......#',
+        '#.............#',
+        '#P...........D#',
+        '###############',
+        '###############'
+      ],
+      traps: [
+        { type: 'crusher', col: 4, homeRow: 1, h: 4, floorRow: 8,
+          trigger: { x: 2.8, y: 4, w: 1, h: 4 } },
+        { type: 'tracker', y: 7.5, clamp: [7.6, 8.8],
+          trigger: { x: 6.4, y: 6, w: 0.8, h: 2 } },
+        { type: 'fakedoor', at: [11, 7] }
+      ]
+    },
+
+    // ---------------------------------------------------- 24
+    {
+      name: { it: "L'ultima bugia", en: 'The last lie' },
+      tip:  { it: 'Non tutte le punte pungono.', en: 'Not every spike stings.' },
+      map: [
+        '###############',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#.............#',
+        '#P............#',
+        '####.h...h.h..#',
+        '#...xxxxxxxxxD#',
+        '###############',
+        '###############'
+      ],
+      traps: [
+        { type: 'fakedoor', at: [3, 5] },
+        { type: 'trapheart', at: [7, 6] }
+      ],
+      final: true
+    }
+  ];
+
+  // ------------------------------------------------------------
+  // Validation: fail loudly at boot instead of mysteriously at
+  // room 8. Checks size, allowed characters, spawn and exit.
+  // ------------------------------------------------------------
+  TD.validateLevels = function () {
+    var ALLOWED = '#=.~c^vxsShPD';
+    TD.LEVELS.forEach(function (lvl, idx) {
+      if (lvl.map.length !== TD.ROOM_H) {
+        throw new Error('Level ' + (idx + 1) + ': expected ' + TD.ROOM_H +
+          ' rows, got ' + lvl.map.length);
+      }
+      var spawns = 0, doors = 0;
+      lvl.map.forEach(function (row, r) {
+        if (row.length !== TD.ROOM_W) {
+          throw new Error('Level ' + (idx + 1) + ' row ' + r +
+            ': expected ' + TD.ROOM_W + ' cols, got ' + row.length);
+        }
+        for (var c = 0; c < row.length; c++) {
+          var ch = row[c];
+          if (ALLOWED.indexOf(ch) === -1) {
+            throw new Error('Level ' + (idx + 1) + ' row ' + r +
+              ' col ' + c + ': unknown tile "' + ch + '"');
+          }
+          if (ch === 'P') spawns++;
+          if (ch === 'D') doors++;
+        }
+      });
+      var revealsDoor = (lvl.traps || []).some(function (t) {
+        return (t.type === 'fakedoor' && t.reveal) ||
+               (t.type === 'movedoor' && t.to);
+      });
+      if (spawns !== 1) {
+        throw new Error('Level ' + (idx + 1) + ': needs exactly 1 spawn, has ' + spawns);
+      }
+      if (doors + (revealsDoor ? 1 : 0) < 1) {
+        throw new Error('Level ' + (idx + 1) + ': has no exit');
+      }
+      if (!lvl.name || !lvl.name.it || !lvl.name.en) {
+        throw new Error('Level ' + (idx + 1) + ': name needs it and en');
+      }
+      if (lvl.tip && (!lvl.tip.it || !lvl.tip.en)) {
+        throw new Error('Level ' + (idx + 1) + ': tip needs it and en');
+      }
+    });
+    return true;
+  };
+
+})(window.TD);

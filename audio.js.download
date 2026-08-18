@@ -1,0 +1,146 @@
+/* ============================================================
+   Trap Dungeons 2 - audio.js
+   Tiny procedural synth. No audio files: every effect is built
+   from oscillators and filtered noise at runtime, so the build
+   stays small and there is nothing extra to load on mobile.
+   iOS requires the AudioContext to be created/resumed inside a
+   user gesture - TD.Audio.unlock() is wired to the first
+   pointerdown/keydown in input.js.
+   ============================================================ */
+'use strict';
+
+(function (TD) {
+
+  TD.Audio = {
+    ctx: null,
+    master: null,
+    muted: false,
+    _noiseBuf: null,
+
+    unlock: function () {
+      if (!this.ctx) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.5;
+        this.master.connect(this.ctx.destination);
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume();
+      if (!this._noiseBuf) {
+        var len = (this.ctx.sampleRate * 0.2) | 0;
+        this._noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        var data = this._noiseBuf.getChannelData(0);
+        for (var i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+      }
+      if (TD.Music) TD.Music.onUnlock();
+    },
+
+    setMuted: function (on) {
+      on = !!on;
+      if (this.muted === on) return;
+      this.muted = on;
+      if (this.master) this.master.gain.value = (this.muted || this._ducked) ? 0 : 0.5;
+      TD.store.set('td2.muted', this.muted);
+      var mb = document.getElementById('mute-btn');
+      if (mb) mb.classList.toggle('muted', this.muted);
+    },
+
+    duck: function (on) {
+      this._ducked = !!on;
+      if (this.master) this.master.gain.value = (this.muted || this._ducked) ? 0 : 0.5;
+    },
+
+    toggleMute: function () {
+      this.muted = !this.muted;
+      if (this.master) this.master.gain.value = (this.muted || this._ducked) ? 0 : 0.5;
+      TD.store.set('td2.muted', this.muted);
+      return this.muted;
+    },
+
+    // ---- building blocks ----
+
+    _tone: function (type, freqFrom, freqTo, dur, vol, delay) {
+      if (!this.ctx || this.muted) return;
+      var t0 = this.ctx.currentTime + (delay || 0);
+      var osc = this.ctx.createOscillator();
+      var g = this.ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freqFrom, t0);
+      if (freqTo && freqTo !== freqFrom) {
+        osc.frequency.exponentialRampToValueAtTime(Math.max(1, freqTo), t0 + dur);
+      }
+      g.gain.setValueAtTime(vol, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.connect(g).connect(this.master);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.02);
+    },
+
+    _noise: function (dur, vol, freq, delay) {
+      if (!this.ctx || this.muted) return;
+      if (!this._noiseBuf) {
+        var len = this.ctx.sampleRate * 0.5;
+        this._noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        var data = this._noiseBuf.getChannelData(0);
+        for (var i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+      }
+      var t0 = this.ctx.currentTime + (delay || 0);
+      var src = this.ctx.createBufferSource();
+      src.buffer = this._noiseBuf;
+      src.loop = true;
+      var filter = this.ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = freq || 1200;
+      var g = this.ctx.createGain();
+      g.gain.setValueAtTime(vol, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      src.connect(filter).connect(g).connect(this.master);
+      src.start(t0);
+      src.stop(t0 + dur + 0.02);
+    },
+
+    // ---- game events ----
+
+    jump: function ()  { this._tone('square', 320, 660, 0.12, 0.16); },
+
+    step: function ()  { this._noise(0.04, 0.05, 900); },
+
+    die: function () {
+      this._noise(0.30, 0.30, 700);
+      this._tone('sawtooth', 380, 60, 0.40, 0.25);
+    },
+
+    trap: function () { // metallic "snap" when a trap springs
+      this._tone('square', 1200, 200, 0.09, 0.20);
+      this._noise(0.07, 0.18, 2400);
+    },
+
+    crumble: function () { this._noise(0.18, 0.16, 500); },
+
+    spring: function () { this._tone('square', 200, 900, 0.18, 0.20); },
+
+    door: function () {
+      this._tone('square', 523, 523, 0.08, 0.18, 0.00);
+      this._tone('square', 659, 659, 0.08, 0.18, 0.08);
+      this._tone('square', 784, 784, 0.12, 0.18, 0.16);
+    },
+
+    troll: function () { // short dissonant sting when the game lies to you
+      this._tone('sawtooth', 220, 220, 0.20, 0.18, 0.00);
+      this._tone('sawtooth', 233, 233, 0.20, 0.18, 0.00);
+    },
+
+    click: function () { this._tone('square', 880, 880, 0.05, 0.12); },
+
+    win: function () {
+      var notes = [523, 659, 784, 1047, 784, 1047];
+      for (var i = 0; i < notes.length; i++) {
+        this._tone('square', notes[i], notes[i], 0.14, 0.18, i * 0.12);
+      }
+    }
+  };
+
+  TD.Audio.muted = !!TD.store.get('td2.muted', false);
+
+})(window.TD);

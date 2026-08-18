@@ -1,0 +1,139 @@
+/* ============================================================
+   Trap Dungeons 2 - music.js
+   A tiny chiptune sequencer on WebAudio, zero audio files,
+   in the spirit of the 8-bit dungeon reference. Three voices:
+   square lead, square bass an octave down, and a noise hat.
+   16-step loops with a lookahead scheduler. Each act transposes
+   the loop and nudges the tempo so the dungeon gets tenser as
+   you go. The music gain hangs off TD.Audio's master, so mute
+   and the ad ducking already apply.
+   ============================================================ */
+'use strict';
+
+(function (TD) {
+
+  var SONGS = {
+    // step value = semitones above the song root, null = rest
+    game: {
+      bpm: 108,
+      root: 45,                                       // A2
+      bass: [0, null, 0, 0, 3, null, 3, 3, 5, null, 5, 5, 7, 7, 10, 7],
+      lead: [12, null, 15, null, 19, 15, null, 12, 17, null, 15, null, 19, null, 22, null],
+      hat:  [1, 0, 0.6, 0, 1, 0, 0.6, 0, 1, 0, 0.6, 0, 1, 0, 0.6, 0.4]
+    },
+    menu: {
+      bpm: 84,
+      root: 45,
+      bass: [0, null, null, null, null, null, null, null, 5, null, null, null, 3, null, null, null],
+      lead: [null, 12, null, 15, null, null, 19, null, null, 17, null, 15, null, null, 12, null],
+      hat:  [0, 0, 0.3, 0, 0, 0, 0.3, 0, 0, 0, 0.3, 0, 0, 0, 0.3, 0]
+    }
+  };
+
+  var ACT_TRANSPOSE = [0, -2, 3, -4, 5, 7];
+  var ACT_TEMPO     = [0,  2, 4,  6, 8, 10];
+
+  TD.Music = {
+    current: null,        // 'game' | 'menu' | null
+    act: 0,
+    _pending: null,
+    _gain: null,
+    _timer: null,
+    _step: 0,
+    _nextAt: 0,
+
+    _ready: function () {
+      var A = TD.Audio;
+      if (!A.ctx || !A.master) return false;
+      if (!this._gain) {
+        this._gain = A.ctx.createGain();
+        this._gain.gain.value = 0.13;
+        this._gain.connect(A.master);
+      }
+      return true;
+    },
+
+    play: function (kind, act) {
+      if (act != null) this.act = act;
+      if (!this._ready()) {            // before the first user gesture
+        this._pending = kind;          // unlock will call us back
+        return;
+      }
+      this._pending = null;
+      if (this.current === kind) return;
+      this.stop();
+      this.current = kind;
+      this._step = 0;
+      this._nextAt = TD.Audio.ctx.currentTime + 0.06;
+      var self = this;
+      this._timer = setInterval(function () { self._schedule(); }, 45);
+    },
+
+    setAct: function (act) {
+      this.act = TD.clamp(act, 0, ACT_TRANSPOSE.length - 1);
+    },
+
+    stop: function () {
+      if (this._timer) { clearInterval(this._timer); this._timer = null; }
+      this.current = null;
+    },
+
+    onUnlock: function () {
+      if (this._pending) {
+        var k = this._pending;
+        this._pending = null;
+        this.play(k, this.act);
+      }
+    },
+
+    _schedule: function () {
+      var ctx = TD.Audio.ctx;
+      var song = SONGS[this.current];
+      if (!ctx || !song) return;
+      var stepDur = 60 / (song.bpm + ACT_TEMPO[this.act]) / 4;   // 16ths
+
+      while (this._nextAt < ctx.currentTime + 0.16) {
+        var s = this._step % 16;
+        var tr = ACT_TRANSPOSE[this.act];
+
+        var b = song.bass[s];
+        if (b !== null) this._tone(song.root - 12 + b + tr, this._nextAt, stepDur * 0.9, 0.5, 'square');
+        var l = song.lead[s];
+        if (l !== null) this._tone(song.root + l + tr, this._nextAt, stepDur * 0.8, 0.30, 'square');
+        var h = song.hat[s];
+        if (h) this._hat(this._nextAt, h * 0.16);
+
+        this._nextAt += stepDur;
+        this._step++;
+      }
+    },
+
+    _tone: function (midi, t, dur, vol, type) {
+      var ctx = TD.Audio.ctx;
+      var o = ctx.createOscillator();
+      var g = ctx.createGain();
+      o.type = type;
+      o.frequency.value = 440 * Math.pow(2, (midi - 69) / 12);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.linearRampToValueAtTime(vol, t + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+      o.connect(g); g.connect(this._gain);
+      o.start(t); o.stop(t + dur + 0.02);
+    },
+
+    _hat: function (t, vol) {
+      var A = TD.Audio, ctx = A.ctx;
+      if (!A._noiseBuf) return;                       // built lazily by sfx
+      var src = ctx.createBufferSource();
+      src.buffer = A._noiseBuf;
+      var f = ctx.createBiquadFilter();
+      f.type = 'highpass'; f.frequency.value = 6000;
+      var g = ctx.createGain();
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+      src.connect(f); f.connect(g); g.connect(this._gain);
+      src.start(t); src.stop(t + 0.06);
+    }
+  };
+
+})(window.TD);

@@ -1,0 +1,187 @@
+/* ============================================================
+   Trap Dungeons 2 - input.js
+   One input state shared by keyboard, touch buttons and click.
+   Exposes both "held" state and edge-triggered "pressed" flags
+   that the player controller consumes once per logic step
+   (needed for jump buffering).
+   ============================================================ */
+'use strict';
+
+(function (TD) {
+
+  TD.Input = {
+    left: false,
+    right: false,
+    jump: false,
+    jumpPressed: false,   // true for the step in which jump went down
+    anyPressed: false,    // used by menus ("press anything")
+    isTouchDevice: false,
+
+    init: function () {
+      this._keys();
+      this._touchButtons();
+      this._unlockers();
+      this._detectTouch();
+    },
+
+    // Consume edge-triggered flags once per logic step.
+    consume: function () {
+      var snap = {
+        jumpPressed: this.jumpPressed,
+        anyPressed: this.anyPressed,
+        tapped: this.tapped,
+        tapX: this.tapX,
+        tapY: this.tapY
+      };
+      this.jumpPressed = false;
+      this.anyPressed = false;
+      this.tapped = false;
+      return snap;
+    },
+
+    _detectTouch: function () {
+      var coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+      this.isTouchDevice = coarse || 'ontouchstart' in window;
+      if (this.isTouchDevice) {
+        document.getElementById('touch-ui').style.display = 'flex';
+      }
+    },
+
+    _keys: function () {
+      var self = this;
+
+      // Keyboard must work everywhere: QWERTY, AZERTY, embeds that
+      // stop propagation, buttons holding focus. So:
+      // - capture phase on window: first in line, nothing upstream
+      //   can swallow the event
+      // - physical codes AND labeled keys: WASD by position covers
+      //   ZQSD on AZERTY, the key fallback covers the labels and
+      //   any browser with unreliable e.code
+      var CODE = {
+        ArrowLeft: 'left', KeyA: 'left',
+        ArrowRight: 'right', KeyD: 'right',
+        ArrowUp: 'jump', KeyW: 'jump', Space: 'jump', KeyZ: 'jump',
+        KeyM: 'mute', KeyR: 'retry', KeyL: 'lang'
+      };
+      var KEY = {
+        arrowleft: 'left', a: 'left', q: 'left',
+        arrowright: 'right', d: 'right',
+        arrowup: 'jump', w: 'jump', z: 'jump',
+        ' ': 'jump', spacebar: 'jump',
+        m: 'mute', r: 'retry', l: 'lang'
+      };
+
+      function actionOf(e) {
+        if (e.code && CODE[e.code]) return CODE[e.code];
+        var k = e.key;
+        if (k == null) return null;
+        return KEY[String(k).toLowerCase()] || null;
+      }
+
+      window.addEventListener('keydown', function (e) {
+        var act = actionOf(e);
+        if (act) e.preventDefault();      // no page scroll, no focused
+        if (e.repeat) return;             // button firing on Space
+        self.anyPressed = true;
+        switch (act) {
+          case 'left': self.left = true; break;
+          case 'right': self.right = true; break;
+          case 'jump': self.jump = true; self.jumpPressed = true; break;
+          case 'mute': TD.Game && TD.Game.toggleMute(); break;
+          case 'retry': TD.Game && TD.Game.retryRoom(); break;
+          case 'lang': TD.Game && TD.Game.toggleLang(); break;
+        }
+      }, { capture: true, passive: false });
+
+      window.addEventListener('keyup', function (e) {
+        switch (actionOf(e)) {
+          case 'left': self.left = false; break;
+          case 'right': self.right = false; break;
+          case 'jump': self.jump = false; break;
+        }
+      }, { capture: true, passive: false });
+
+      // Buttons must never hold keyboard focus: a focused button
+      // turns Space into a click and eats the controls.
+      document.addEventListener('click', function (e) {
+        var el = e.target;
+        if (el && el.tagName === 'BUTTON' && el.blur) el.blur();
+      }, true);
+      window.addEventListener('pointerdown', function () {
+        try { window.focus(); } catch (err) { /* embeds may deny */ }
+        try {
+          if (document.activeElement === document.body ||
+              document.activeElement === null) {
+            var cv = TD.Screen.canvas;
+            if (cv && cv.focus) cv.focus({ preventScroll: true });
+          }
+        } catch (err2) { /* focus is best effort */ }
+      }, { capture: true, passive: true });
+    },
+
+    _touchButtons: function () {
+      var self = this;
+      // Pointer events cover touch + mouse and give us per-pointer
+      // tracking, so holding LEFT while tapping JUMP works (multi-touch).
+      var buttons = document.querySelectorAll('.tc-btn');
+      buttons.forEach(function (btn) {
+        var action = btn.getAttribute('data-action');
+
+        function down(e) {
+          e.preventDefault();
+          btn.classList.add('held');
+          if (action === 'left')  self.left = true;
+          if (action === 'right') self.right = true;
+          if (action === 'jump')  { self.jump = true; self.jumpPressed = true; }
+          self.anyPressed = true;
+          try {
+            if (e.pointerId != null && btn.setPointerCapture) {
+              btn.setPointerCapture(e.pointerId);
+            }
+          } catch (err) { /* pointer already gone: harmless */ }
+        }
+        function up(e) {
+          e.preventDefault();
+          btn.classList.remove('held');
+          if (action === 'left')  self.left = false;
+          if (action === 'right') self.right = false;
+          if (action === 'jump')  self.jump = false;
+        }
+
+        btn.addEventListener('pointerdown', down, { passive: false });
+        btn.addEventListener('pointerup', up, { passive: false });
+        btn.addEventListener('pointercancel', up, { passive: false });
+        btn.addEventListener('lostpointercapture', up);
+        btn.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+      });
+
+      // Tapping the canvas itself acts as "any key" for menus.
+      document.getElementById('game').addEventListener('pointerdown', function (e) {
+        e.preventDefault();
+        self.anyPressed = true;
+        var c = TD.Screen.canvas;
+        if (c && c.getBoundingClientRect) {
+          var r = c.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) {
+            self.tapX = (e.clientX - r.left) / r.width * TD.VIEW_W;
+            self.tapY = (e.clientY - r.top) / r.height * TD.VIEW_H;
+            self.tapped = true;
+          }
+        }
+      }, { passive: false });
+
+      // Belt and braces against iOS gestures/scroll inside the page.
+      document.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
+      document.addEventListener('gesturestart', function (e) { e.preventDefault(); });
+      document.addEventListener('dblclick', function (e) { e.preventDefault(); });
+    },
+
+    _unlockers: function () {
+      // WebAudio must be started from a user gesture on iOS/Android.
+      var unlock = function () { TD.Audio.unlock(); };
+      window.addEventListener('pointerdown', unlock);
+      window.addEventListener('keydown', unlock);
+    }
+  };
+
+})(window.TD);

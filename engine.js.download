@@ -1,0 +1,267 @@
+/* ============================================================
+   Trap Dungeons 2 - engine.js
+   Core runtime: namespace, constants, math helpers, the
+   resolution-independent canvas scaler and the fixed-timestep
+   game loop. No game rules live here.
+   ============================================================ */
+'use strict';
+
+window.TD = window.TD || {};
+
+(function (TD) {
+
+  // ---------- World constants ----------
+  TD.TILE   = 32;            // tile size in world pixels
+  TD.ROOM_W = 15;            // tiles per room, horizontally
+  TD.ROOM_H = 10;            // tiles per room, vertically
+  TD.VIEW_W = TD.TILE * TD.ROOM_W;   // 480
+  TD.VIEW_H = TD.TILE * TD.ROOM_H;   // 320
+  TD.STEP   = 1 / 60;        // fixed logic step (seconds)
+  TD.MAX_FRAME = 0.25;       // clamp long frames (tab switch, GC)
+
+  // ---------- Small math helpers ----------
+  TD.clamp = function (v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); };
+  TD.lerp  = function (a, b, t)   { return a + (b - a) * t; };
+  TD.rand  = function (lo, hi)    { return lo + Math.random() * (hi - lo); };
+  TD.randInt = function (lo, hi)  { return Math.floor(TD.rand(lo, hi + 1)); };
+
+  TD.aabb = function (ax, ay, aw, ah, bx, by, bw, bh) {
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  };
+
+  // Persistent storage that never throws (Safari private mode, file://, ...)
+  TD.store = {
+    // Storage strategy, most authoritative first:
+    // 1. GamePix.localStorage when the SDK is present: synchronous,
+    //    proxied by the platform, works in iframes and private
+    //    modes where window.localStorage is denied.
+    // 2. window.localStorage for plain local play.
+    // 3. an in-memory map so a denied write never loses state.
+    _mem: {},
+    _pls: function () {
+      try {
+        var gp = window.GamePix;
+        if (gp && gp.localStorage &&
+            typeof gp.localStorage.getItem === 'function') {
+          return gp.localStorage;
+        }
+      } catch (e) { /* no platform storage */ }
+      return null;
+    },
+    get: function (key, fallback) {
+      var inMem = Object.prototype.hasOwnProperty.call(this._mem, key);
+      var pls = this._pls();
+      if (pls) {
+        try {
+          var pv = pls.getItem(key);
+          if (pv !== null && pv !== undefined) return JSON.parse(pv);
+        } catch (e0) { /* fall through */ }
+      }
+      try {
+        var v = window.localStorage.getItem(key);
+        if (v !== null) return JSON.parse(v);
+      } catch (e) { /* unreadable or denied: use memory */ }
+      return inMem ? this._mem[key] : fallback;
+    },
+    set: function (key, value) {
+      this._mem[key] = value;
+      var json;
+      try { json = JSON.stringify(value); } catch (ej) { return; }
+      var pls = this._pls();
+      if (pls) {
+        try { pls.setItem(key, json); } catch (e0) { /* best effort */ }
+      }
+      try {
+        window.localStorage.setItem(key, json);
+      } catch (e) { /* memory fallback already holds it */ }
+    }
+  };
+
+  // ---------- Canvas scaler ----------
+  // Renders at a fixed virtual resolution (480x320) and scales the
+  // canvas element to the largest size that fits the screen.
+  // Integer scale factors keep the pixel art razor sharp; on very
+  // small screens it falls back to fractional scaling so the whole
+  // room always stays visible.
+  TD.Screen = {
+    canvas: null,
+    ctx: null,
+    scale: 1,
+
+    init: function () {
+      this.canvas = document.getElementById('game');
+      this.ctx = this.canvas.getContext('2d', { alpha: false });
+      this.canvas.width = TD.VIEW_W;
+      this.canvas.height = TD.VIEW_H;
+      this.ctx.imageSmoothingEnabled = false;
+
+      var resize = this.resize.bind(this);
+      window.addEventListener('resize', resize);
+      window.addEventListener('orientationchange', function () {
+        setTimeout(resize, 60); // iOS reports stale sizes right away
+      });
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', resize);
+      }
+      this.resize();
+    },
+
+    resize: function () {
+      var vw = (window.visualViewport && window.visualViewport.width)  || window.innerWidth;
+      var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+
+      var sx = vw / TD.VIEW_W;
+      var sy = vh / TD.VIEW_H;
+      var s = Math.min(sx, sy);
+
+      // Prefer crisp integer scaling when there is room for it.
+      if (s >= 1) s = Math.max(1, Math.floor(s));
+
+      this.scale = s;
+      this.canvas.style.width  = Math.round(TD.VIEW_W * s) + 'px';
+      this.canvas.style.height = Math.round(TD.VIEW_H * s) + 'px';
+    }
+  };
+
+  // ---------- Particles ----------
+  // One pooled system for death bursts, dust, crumble debris, confetti.
+  TD.Particles = {
+    pool: [],
+
+    spawn: function (x, y, opts) {
+      opts = opts || {};
+      var n = opts.count || 8;
+      for (var i = 0; i < n; i++) {
+        this.pool.push({
+          x: x, y: y,
+          vx: TD.rand(opts.vxMin != null ? opts.vxMin : -120, opts.vxMax != null ? opts.vxMax : 120),
+          vy: TD.rand(opts.vyMin != null ? opts.vyMin : -220, opts.vyMax != null ? opts.vyMax : -40),
+          g:  opts.gravity != null ? opts.gravity : 600,
+          life: TD.rand(opts.lifeMin || 0.25, opts.lifeMax || 0.7),
+          size: opts.size || TD.randInt(2, 4),
+          color: opts.colors ? opts.colors[TD.randInt(0, opts.colors.length - 1)] : '#ffffff'
+        });
+      }
+    },
+
+    update: function (dt) {
+      for (var i = this.pool.length - 1; i >= 0; i--) {
+        var p = this.pool[i];
+        p.life -= dt;
+        if (p.life <= 0) { this.pool.splice(i, 1); continue; }
+        p.vy += p.g * dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+      }
+    },
+
+    draw: function (ctx) {
+      for (var i = 0; i < this.pool.length; i++) {
+        var p = this.pool[i];
+        ctx.globalAlpha = TD.clamp(p.life * 3, 0, 1);
+        ctx.fillStyle = p.color;
+        ctx.fillRect(Math.round(p.x), Math.round(p.y), p.size, p.size);
+      }
+      ctx.globalAlpha = 1;
+    },
+
+    clear: function () { this.pool.length = 0; }
+  };
+
+  // ---------- Screen shake ----------
+  TD.Shake = {
+    t: 0, power: 0, x: 0, y: 0,
+    hit: function (power, time) {
+      this.power = Math.max(this.power, power);
+      this.t = Math.max(this.t, time);
+    },
+    update: function (dt) {
+      if (this.t > 0) {
+        this.t -= dt;
+        var k = this.power * TD.clamp(this.t * 6, 0, 1);
+        this.x = TD.rand(-k, k);
+        this.y = TD.rand(-k, k);
+      } else {
+        this.x = 0; this.y = 0; this.power = 0;
+      }
+    }
+  };
+
+  // ---------- Fixed-timestep loop ----------
+  // Logic always advances in exact 1/60s steps regardless of the
+  // display refresh rate (120Hz iPhones, 144Hz monitors, throttled
+  // tabs). Rendering happens once per animation frame.
+  // Any runtime error surfaces instead of silently freezing things:
+  // console always, plus a small dismissable strip on screen so a
+  // tester can read and report it from any device.
+  TD.DIAG = { errors: [] };
+  TD.reportError = function (err, where) {
+    var msg = where + ': ' + (err && err.message ? err.message : String(err));
+    TD.DIAG.errors.push(msg);
+    if (TD.DIAG.errors.length > 5) TD.DIAG.errors.shift();
+    if (window.console && console.error) console.error('[TD]', msg, err);
+    try {
+      var el = document.getElementById('err-strip');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'err-strip';
+        el.addEventListener('pointerdown', function () {
+          el.style.display = 'none';
+        });
+        document.body.appendChild(el);
+      }
+      el.textContent = 'ERR ' + msg.slice(0, 140) + '  (tap to hide)';
+      el.style.display = 'block';
+    } catch (e2) { /* reporting must never throw */ }
+  };
+  if (window.addEventListener) {
+    window.addEventListener('error', function (ev) {
+      if (ev && ev.message) {
+        TD.DIAG.errors.push('window: ' + ev.message);
+        if (TD.DIAG.errors.length > 5) TD.DIAG.errors.shift();
+      }
+    });
+  }
+
+  TD.Loop = {
+    acc: 0,
+    last: 0,
+    running: false,
+    update: null,   // function(dt)
+    render: null,   // function(ctx)
+
+    start: function () {
+      if (this.running) return;
+      this.running = true;
+      this.last = performance.now();
+      var self = this;
+      function frame(now) {
+        if (!self.running) return;
+        // schedule FIRST: no exception below can ever kill the loop
+        requestAnimationFrame(frame);
+        var elapsed = (now - self.last) / 1000;
+        self.last = now;
+        if (elapsed > TD.MAX_FRAME) elapsed = TD.MAX_FRAME;
+        self.acc += elapsed;
+        var safety = 0;
+        while (self.acc >= TD.STEP && safety < 8) {
+          try {
+            self.update(TD.STEP);
+          } catch (e) {
+            TD.reportError(e, 'update');
+          }
+          self.acc -= TD.STEP;
+          safety++;
+        }
+        if (self.acc > TD.STEP * 2) self.acc = 0;   // never spiral
+        try {
+          self.render(TD.Screen.ctx);
+        } catch (e2) {
+          TD.reportError(e2, 'render');
+        }
+      }
+      requestAnimationFrame(frame);
+    }
+  };
+
+})(window.TD);

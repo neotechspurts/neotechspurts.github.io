@@ -1,0 +1,122 @@
+/* ============================================================
+   Trap Dungeons 2 - assets.js
+   Loads the original art (same PNGs and fonts as the first
+   build) and normalizes it: the source sprites have mixed
+   canvas sizes (Idle 61x89, Walk 100x100), so each frame is
+   trimmed to its opaque bounds and re-rendered at a common
+   in-game height. Doing this once at boot keeps the render
+   loop free of per-frame scaling math.
+   ============================================================ */
+'use strict';
+
+(function (TD) {
+
+  var FILES = {
+    ground:    'assets/Ground.png',
+    halfBrick: 'assets/Brick_Half.png',
+    spikeS:    'assets/Spikes_2.png',   // 16px wide spikes
+    spikeL:    'assets/Spikes_4.png',   // 32px wide spikes
+    idle:      'assets/Idle_1.png',
+    walk1:     'assets/Walk_1.png',
+    walk2:     'assets/Walk_2.png',
+    walk3:     'assets/Walk_3.png',
+    walk4:     'assets/Walk_4.png',
+    heart:     'assets/Heart.png',
+    title:     'assets/Title.png',
+    startBtn:  'assets/Start_Button.png'
+  };
+
+  TD.Assets = {
+    img: {},        // raw Image objects
+    player: {       // normalized frames (canvases)
+      idle: null,
+      walk: []      // 4 frames
+    },
+    PLAYER_H: 26,   // on-screen player height in px
+    PLAYER_W: 0,    // computed from idle aspect ratio
+
+    load: function (onDone) {
+      var self = this;
+      var keys = Object.keys(FILES);
+      var pending = keys.length;
+      var failed = [];
+
+      keys.forEach(function (key) {
+        var im = new Image();
+        im.onload = function () {
+          if (TD.Platform) {
+            var doneCount = keys.length - pending + 1;
+            TD.Platform.loading(10 + Math.round(85 * doneCount / keys.length));
+          }
+          done();
+        };
+        im.onerror = function () { failed.push(FILES[key]); done(); };
+        im.src = FILES[key];
+        self.img[key] = im;
+      });
+
+      function done() {
+        pending--;
+        if (pending > 0) return;
+        self._buildPlayerFrames();
+        onDone(failed);
+      }
+    },
+
+    // ----- sprite normalization -----
+
+    _trim: function (image) {
+      // Returns a canvas cropped to the opaque pixels of the image.
+      var c = document.createElement('canvas');
+      c.width = image.width; c.height = image.height;
+      var x = c.getContext('2d');
+      x.drawImage(image, 0, 0);
+      var data;
+      try {
+        data = x.getImageData(0, 0, c.width, c.height).data;
+      } catch (e) {
+        // getImageData can fail on file:// in some browsers; fall back
+        // to the untrimmed image rather than breaking the game.
+        return c;
+      }
+      var minX = c.width, minY = c.height, maxX = -1, maxY = -1;
+      for (var py = 0; py < c.height; py++) {
+        for (var px = 0; px < c.width; px++) {
+          if (data[(py * c.width + px) * 4 + 3] > 8) {
+            if (px < minX) minX = px;
+            if (px > maxX) maxX = px;
+            if (py < minY) minY = py;
+            if (py > maxY) maxY = py;
+          }
+        }
+      }
+      if (maxX < 0) return c; // fully transparent, keep as is
+      var out = document.createElement('canvas');
+      out.width = maxX - minX + 1;
+      out.height = maxY - minY + 1;
+      out.getContext('2d').drawImage(c, -minX, -minY);
+      return out;
+    },
+
+    _scaleToHeight: function (canvas, h) {
+      var ratio = canvas.width / canvas.height;
+      var out = document.createElement('canvas');
+      out.height = h;
+      out.width = Math.max(1, Math.round(h * ratio));
+      var x = out.getContext('2d');
+      x.imageSmoothingEnabled = false;
+      x.drawImage(canvas, 0, 0, out.width, out.height);
+      return out;
+    },
+
+    _buildPlayerFrames: function () {
+      var self = this;
+      this.player.idle = this._scaleToHeight(this._trim(this.img.idle), this.PLAYER_H);
+      ['walk1', 'walk2', 'walk3', 'walk4'].forEach(function (k) {
+        self.player.walk.push(self._scaleToHeight(self._trim(self.img[k]), self.PLAYER_H));
+      });
+      this.PLAYER_W = this.player.idle.width;
+    }
+  };
+
+})(window.TD);

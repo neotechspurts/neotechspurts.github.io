@@ -1,0 +1,390 @@
+/* ============================================================
+   Trap Dungeons 2 - gfx.js
+   Procedural pixel art, no image files. The look chases the
+   classic dungeon-platformer reference: chunky beveled stone
+   bricks on near-black, warm torch light, wooden arched doors,
+   silver spikes. All original drawings, generated at boot.
+
+   Six themes, one per act of four rooms. Every theme bakes:
+   - 4 brick tile variants (subtle jitter, cracks, moss specks)
+   - a half-brick platform tile
+   - a 480x320 background (faint giant back-bricks + floor fade)
+   The spike, torch flames, glow disc and vignette are shared.
+
+   TD.GFX.cur points at the active theme so traps can stay
+   theme-agnostic: they just draw TD.GFX.cur.ground / .spike.
+   ============================================================ */
+'use strict';
+
+(function (TD) {
+
+  var T = TD.TILE;
+
+  var THEMES = [
+    { grout: '#2a1812', base: '#8a5a32', light: '#b27e4a', dark: '#5e3a1e', deco: '#6e4626' },
+    { grout: '#14201a', base: '#5a7a58', light: '#7e9e74', dark: '#3a523a', deco: '#86a87e' },
+    { grout: '#240e10', base: '#8a3038', light: '#aa4a4e', dark: '#5c1e26', deco: '#742a32' },
+    { grout: '#0e1624', base: '#44608a', light: '#6080ae', dark: '#2c4060', deco: '#54719c' },
+    { grout: '#180e22', base: '#5e3a7e', light: '#7e58a2', dark: '#3e2456', deco: '#6e4a92' },
+    { grout: '#2a1e08', base: '#a07820', light: '#cfa43a', dark: '#6e4f12', deco: '#b89230' }
+  ];
+
+  function canvas(w, h) {
+    var c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    var x = c.getContext('2d');
+    x.imageSmoothingEnabled = false;
+    return { c: c, x: x };
+  }
+
+  // Tiny deterministic rng so variants are stable run to run.
+  function rng(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (s * 1664525 + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+  }
+
+  /* ---------------- brick tile ----------------
+     Two 16px courses in true running bond: course A is one wide
+     brick per tile (seams on tile borders), course B is shifted
+     half a module so its halves join across neighbouring tiles
+     into the same wide 30x14 bricks. Grout 2px, bevel top-left,
+     shade bottom-right, per-variant cracks or moss. */
+  function brickTile(theme, variant) {
+    var k = canvas(T, T), x = k.x, r = rng(variant * 7919 + 17);
+    x.fillStyle = theme.grout;
+    x.fillRect(0, 0, T, T);
+
+    function brick(bx, by, bw) {
+      var jit = (r() - 0.5) * 0.12;
+      x.fillStyle = shade(theme.base, jit);
+      x.fillRect(bx, by, bw, 14);
+      x.fillStyle = shade(theme.light, jit);
+      x.fillRect(bx, by, bw, 2);                     // top bevel
+      x.fillRect(bx, by, 2, 14);                     // left bevel
+      x.fillStyle = shade(theme.dark, jit);
+      x.fillRect(bx, by + 12, bw, 2);                // bottom shade
+      x.fillRect(bx + bw - 2, by + 2, 2, 12);        // right shade
+    }
+
+    brick(1, 2, 30);                                 // course A: full slab
+    brick(0, 18, 15);                                // course B: half + half,
+    brick(17, 18, 15);                               // joins across tiles
+
+    if (variant === 2) {                             // hairline crack
+      x.strokeStyle = 'rgba(0,0,0,0.5)';
+      x.lineWidth = 1;
+      x.beginPath();
+      x.moveTo(8 + r() * 6, 4);
+      x.lineTo(14 + r() * 6, 12);
+      x.lineTo(10 + r() * 6, 26);
+      x.stroke();
+    }
+    if (variant === 3) {                             // moss / wear specks
+      x.fillStyle = 'rgba(0,0,0,0.28)';
+      for (var i = 0; i < 5; i++) {
+        x.fillRect((r() * 28) | 0, (r() * 28) | 0, 2, 2);
+      }
+      x.fillStyle = theme.deco;
+      x.globalAlpha = 0.5;
+      x.fillRect((r() * 24 + 2) | 0, (r() * 24 + 4) | 0, 4, 2);
+      x.globalAlpha = 1;
+    }
+    return k.c;
+  }
+
+  function halfTile(theme) {
+    var k = canvas(T, T), x = k.x;
+    x.fillStyle = theme.grout;
+    x.fillRect(0, 0, T, 14);
+    x.fillStyle = theme.base;
+    x.fillRect(1, 2, 30, 10);
+    x.fillStyle = theme.light;
+    x.fillRect(1, 2, 30, 2);
+    x.fillRect(1, 2, 2, 10);
+    x.fillStyle = theme.dark;
+    x.fillRect(1, 10, 30, 2);
+    x.fillRect(29, 4, 2, 8);
+    x.fillStyle = 'rgba(0,0,0,0.45)';                // underside lip
+    x.fillRect(0, 12, T, 2);
+    return k.c;
+  }
+
+  /* ---------------- shared sprites ---------------- */
+
+  function spikeStrip() {                            // 32x15, 4 silver spikes
+    var k = canvas(32, 15), x = k.x;
+    for (var i = 0; i < 4; i++) {
+      var bx = i * 8;
+      x.fillStyle = '#5a5e66';
+      x.beginPath(); x.moveTo(bx, 15); x.lineTo(bx + 4, 0); x.lineTo(bx + 8, 15); x.closePath(); x.fill();
+      x.fillStyle = '#c8ccd4';
+      x.beginPath(); x.moveTo(bx, 15); x.lineTo(bx + 4, 0); x.lineTo(bx + 4, 15); x.closePath(); x.fill();
+      x.fillStyle = '#ffffff';
+      x.fillRect(bx + 3, 2, 1, 2);                   // tip glint
+    }
+    x.fillStyle = '#23252b';
+    x.fillRect(0, 13, 32, 2);                        // base strip
+    return k.c;
+  }
+
+  function torchFrames() {                           // 3 flame frames, 10x14
+    var frames = [];
+    for (var f = 0; f < 3; f++) {
+      var k = canvas(10, 14), x = k.x;
+      x.fillStyle = '#5a3a1e';                       // handle
+      x.fillRect(4, 9, 2, 5);
+      x.fillStyle = '#2e1c0e';
+      x.fillRect(3, 12, 4, 2);
+      var sway = f - 1;
+      x.fillStyle = '#d8401e';
+      x.fillRect(2 + sway, 2, 6, 7);
+      x.fillStyle = '#ff8a1e';
+      x.fillRect(3 + sway, 3, 4, 5);
+      x.fillStyle = '#ffd84a';
+      x.fillRect(4 + sway, 4 + (f === 1 ? 1 : 0), 2, 3);
+      frames.push(k.c);
+    }
+    return frames;
+  }
+
+  function glowDisc() {                              // warm radial light
+    var k = canvas(96, 96), x = k.x;
+    var g = x.createRadialGradient(48, 48, 4, 48, 48, 48);
+    g.addColorStop(0, 'rgba(255,190,90,0.55)');
+    g.addColorStop(0.5, 'rgba(255,150,50,0.18)');
+    g.addColorStop(1, 'rgba(255,120,30,0)');
+    x.fillStyle = g;
+    x.fillRect(0, 0, 96, 96);
+    return k.c;
+  }
+
+  function vignette() {
+    var k = canvas(TD.VIEW_W, TD.VIEW_H), x = k.x;
+    var g = x.createRadialGradient(240, 150, 130, 240, 160, 330);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(1, 'rgba(0,0,0,0.42)');
+    x.fillStyle = g;
+    x.fillRect(0, 0, TD.VIEW_W, TD.VIEW_H);
+    return k.c;
+  }
+
+  function background(theme) {
+    var k = canvas(TD.VIEW_W, TD.VIEW_H), x = k.x;
+    x.fillStyle = '#060608';
+    x.fillRect(0, 0, TD.VIEW_W, TD.VIEW_H);
+    // faint giant back-wall bricks
+    x.globalAlpha = 0.10;
+    x.strokeStyle = theme.light;
+    x.lineWidth = 2;
+    for (var row = 0; row < 5; row++) {
+      var y = row * 64;
+      x.strokeRect(-1, y, 482, 64);
+      var off = row % 2 ? 0 : 64;
+      for (var bx = off; bx < TD.VIEW_W; bx += 128) {
+        x.beginPath(); x.moveTo(bx, y); x.lineTo(bx, y + 64); x.stroke();
+      }
+    }
+    x.globalAlpha = 1;
+    // floor fade
+    var g = x.createLinearGradient(0, 200, 0, 320);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(1, 'rgba(0,0,0,0.5)');
+    x.fillStyle = g;
+    x.fillRect(0, 200, TD.VIEW_W, 120);
+    return k.c;
+  }
+
+  /* ---------------- doors ----------------
+     Stone arch + planked wooden door. Real and fake are pixel
+     identical by design; only the inner glow pulses on real
+     ones, and fake ones glow exactly the same. That's the joke. */
+  function drawDoor(ctx, col, row, pop, gt, theme) {
+    var px = col * T, py = row * T;
+    var lift = pop ? Math.round(pop * 10) : 0;
+    var glow = 0.45 + Math.sin(gt * 3 + col) * 0.18;
+
+    ctx.fillStyle = theme.dark;                      // arch frame
+    ctx.fillRect(px + 3, py + 4 - lift, 26, 28);
+    ctx.fillStyle = theme.light;
+    ctx.fillRect(px + 3, py + 4 - lift, 26, 2);
+    ctx.fillRect(px + 3, py + 4 - lift, 2, 28);
+    ctx.fillStyle = '#0a0810';                       // opening
+    ctx.fillRect(px + 6, py + 7 - lift, 20, 25);
+    ctx.globalAlpha = glow;                          // inner light
+    ctx.fillStyle = '#ffc868';
+    ctx.fillRect(px + 7, py + 9 - lift, 18, 23);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#5a3a1e';                       // planks
+    ctx.fillRect(px + 8, py + 10 - lift, 16, 22);
+    ctx.fillStyle = '#6e4a28';
+    ctx.fillRect(px + 8, py + 10 - lift, 4, 22);
+    ctx.fillRect(px + 16, py + 10 - lift, 4, 22);
+    ctx.fillStyle = '#3a2410';
+    ctx.fillRect(px + 12, py + 10 - lift, 1, 22);
+    ctx.fillRect(px + 20, py + 10 - lift, 1, 22);
+    ctx.fillStyle = '#1c1812';                       // hinges + knob
+    ctx.fillRect(px + 8, py + 13 - lift, 3, 2);
+    ctx.fillRect(px + 8, py + 26 - lift, 3, 2);
+    ctx.fillStyle = '#caa84a';
+    ctx.fillRect(px + 21, py + 20 - lift, 2, 2);
+  }
+
+  /* ---------------- player ----------------
+     Original pixel explorer in the spirit of the reference:
+     wide-brim hat, green shirt, white shorts, tiny boots. Drawn
+     from character grids so the art lives readably in code.
+     Frames: idle, 4-step walk (frame 1 doubles as the air pose). */
+  var PLAYER_PAL = {
+    D: '#a35f22',   // hat crown (burnt brown, sampled 180,102,36)
+    B: '#9c6028',   // hat brim
+    F: '#f2c542',   // face + hands (warm yellow skin)
+    h: '#4c1d15',   // hair at the back (sampled 76,29,21)
+    e: '#1f1409',   // eye
+    S: '#589933',   // shirt (medium green, sampled 88,153,51)
+    s: '#46792c',   // shirt hem (darker green)
+    W: '#dcdbd9',   // shorts (off white, sampled 220,219,217)
+    w: '#bcbcc0',   // shorts crease
+    L: '#a26342',   // legs + boots (sampled 162,99,66)
+    l: '#7a4528'    // boot soles
+  };
+
+  var PLAYER_HEAD = [
+    '...DDDDD.....',
+    '...DDDDD.....',
+    '.BBBBBBBBBB..',
+    '..hFFFFFFF...',
+    '..hFFFFFeF...',
+    '..hFFFFFFF...',
+    '...SSSSSS....',
+    '..FSSSSSSF...',
+    '..FSSSSSSF...',
+    '...ssssss....',
+    '...WWWWWW....',
+    '...WwWWwW....'
+  ];
+
+  var PLAYER_LEGS = {
+    idle: ['...LL..LL....',
+           '..lLL..LLl...'],
+    a:    ['..LL....LL...',
+           '.lLL....LLl..'],
+    b:    ['....LLLL.....',
+           '...lLLLLl....'],
+    c:    ['...LLL.LL....',
+           '..lLL...LLl..']
+  };
+
+  function playerFrame(legs, scale) {
+    var rows = PLAYER_HEAD.concat(legs);
+    var w = rows[0].length, h = rows.length;
+    var k = canvas(w * scale, h * scale), x = k.x;
+    for (var r = 0; r < h; r++) {
+      for (var c = 0; c < w; c++) {
+        var col = PLAYER_PAL[rows[r].charAt(c)];
+        if (col) {
+          x.fillStyle = col;
+          x.fillRect(c * scale, r * scale, scale, scale);
+        }
+      }
+    }
+    return k.c;
+  }
+
+  function buildPlayer() {
+    var S = 2;                                      // 13x14 grid -> 26x28
+    return {
+      idle: playerFrame(PLAYER_LEGS.idle, S),
+      walk: [
+        playerFrame(PLAYER_LEGS.a, S),
+        playerFrame(PLAYER_LEGS.b, S),              // air pose too
+        playerFrame(PLAYER_LEGS.c, S),
+        playerFrame(PLAYER_LEGS.b, S)
+      ]
+    };
+  }
+
+  TD.GFX = {
+    themes: [],
+    spike: null,
+    torch: null,
+    glow: null,
+    vig: null,
+    cur: null,
+    actIndex: 0,
+
+    init: function () {
+      for (var a = 0; a < THEMES.length; a++) {
+        var t = THEMES[a];
+        this.themes.push({
+          def: t,
+          tiles: [brickTile(t, 0), brickTile(t, 1), brickTile(t, 2), brickTile(t, 3)],
+          half: halfTile(t),
+          bg: background(t)
+        });
+      }
+      this.spike = spikeStrip();
+      this.player = buildPlayer();
+      this.torch = torchFrames();
+      this.glow = glowDisc();
+      this.vig = vignette();
+      this.setAct(0);
+    },
+
+    setAct: function (a) {
+      this.actIndex = TD.clamp(a, 0, this.themes.length - 1);
+      var th = this.themes[this.actIndex];
+      this.cur = {
+        theme: th.def,
+        ground: th.tiles[0],
+        tiles: th.tiles,
+        half: th.half,
+        spike: this.spike,
+        bg: th.bg
+      };
+    },
+
+    // stable variant pick so walls look varied but deterministic
+    tileAt: function (col, row) {
+      var th = this.themes[this.actIndex];
+      var n = (col * 7 + row * 13 + this.actIndex * 5) % 10;
+      if (n === 7) return th.tiles[2];
+      if (n === 9) return th.tiles[3];
+      return th.tiles[n % 2];
+    },
+
+    drawDoor: function (ctx, col, row, pop, gt) {
+      drawDoor(ctx, col, row, pop, gt, this.cur.theme);
+    },
+
+    drawTorch: function (ctx, x, y, gt) {
+      var f = ((gt * 8) | 0) % 3;
+      var flick = 0.2 + Math.sin(gt * 13 + x) * 0.05;
+      ctx.globalAlpha = flick;
+      ctx.drawImage(this.glow, Math.round(x - 43), Math.round(y - 44), 96, 96);
+      ctx.globalAlpha = 1;
+      ctx.drawImage(this.torch[f], Math.round(x - 5), Math.round(y - 10), 10, 14);
+    },
+
+    drawShadow: function (ctx, cx, feetY, w) {
+      ctx.globalAlpha = 0.3;
+      ctx.fillStyle = '#000';
+      ctx.beginPath();
+      ctx.ellipse(Math.round(cx), Math.round(feetY) + 1, w, 3, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  };
+
+  function shade(hex, amt) {
+    var n = parseInt(hex.slice(1), 16);
+    var r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+    r = TD.clamp((r * (1 + amt)) | 0, 0, 255);
+    g = TD.clamp((g * (1 + amt)) | 0, 0, 255);
+    b = TD.clamp((b * (1 + amt)) | 0, 0, 255);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+})(window.TD);

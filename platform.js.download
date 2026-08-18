@@ -1,0 +1,150 @@
+/* ============================================================
+   Trap Dungeons 2 - platform.js
+   Thin wrapper around the official GamePix SDK v3 global.
+   API verified at runtime against
+   https://integration.gamepix.com/sdk/v3/gamepix.sdk.js:
+
+     GamePix.loading(percent)      report load progress 0..100
+     GamePix.loaded() -> Promise   game ready, platform says go
+     GamePix.interstitialAd() -> Promise
+     GamePix.rewardAd() -> Promise<{ success: boolean }>
+     GamePix.ping(GamePix.CONST.X) analytics events
+     GamePix.lang()                player's preferred language
+     GamePix.updateLevel(n) / updateScore(n)
+     GamePix.happyMoment() / sadMoment()
+     GamePix.on.pause/resume/soundOn/soundOff   platform callbacks
+
+   Everything here no-ops cleanly when the SDK is absent, so the
+   game runs identically in local development.
+   ============================================================ */
+'use strict';
+
+(function (TD) {
+
+  TD.Platform = {
+    has: false,
+    _lang: null,
+    _pct: 5,
+    _beat: null,
+
+    init: function () {
+      var gp = window.GamePix;
+      this.has = !!(gp && typeof gp.loaded === 'function');
+      if (!this.has) return;
+
+      // The platform can pause us at any time (overlays, tab
+      // switches, its own ads). Reuse the same freeze the ad
+      // layer uses: world, timer and inputs all stop.
+      try {
+        gp.on.pause = function () {
+          if (TD.Ads.hooks.onPause) TD.Ads.hooks.onPause();
+        };
+        gp.on.resume = function () {
+          if (TD.Ads.hooks.onResume) TD.Ads.hooks.onResume();
+        };
+        gp.on.soundOff = function () { TD.Audio.setMuted(true); };
+        gp.on.soundOn = function () { TD.Audio.setMuted(false); };
+      } catch (e) { /* callbacks are best effort */ }
+
+      // Preferred language: apply it only if the player never
+      // chose one explicitly (?lang= or the in-game toggle).
+      try {
+        var self = this;
+        var l = gp.lang && gp.lang();
+        var apply = function (v) {
+          self._lang = v;
+          if (!v || !TD.I18N) return;
+          var hasUrl = /[?&]lang=/.test(window.location.search || '');
+          var stored = TD.store.get('td2.lang', null);
+          if (!hasUrl && !stored) {
+            TD.I18N.set(/^it/i.test(String(v)) ? 'it' : 'en', false);
+          }
+        };
+        if (l && typeof l.then === 'function') l.then(apply, function () {});
+        else apply(l);
+      } catch (e) { /* language is a nicety */ }
+    },
+
+    // The QA tool (and the player) can attach their listeners a
+    // moment after the game boots: a single loading event would be
+    // lost. So progress is heart-beaten every 200ms, monotonically,
+    // until loaded() resolves, then sealed with a 100.
+    loading: function (pct) {
+      this._pct = Math.max(this._pct, Math.min(99, pct | 0));
+      this._send(this._pct);
+      if (this.has && !this._beat) {
+        var self = this;
+        this._beat = setInterval(function () { self._send(self._pct); }, 200);
+      }
+    },
+
+    _send: function (pct) {
+      if (!this.has) return;
+      try { window.GamePix.loading(Math.max(0, Math.min(100, pct | 0))); }
+      catch (e) { /* ignore */ }
+    },
+
+    // Resolves when the platform is ready for the game to start.
+    // Without the SDK it returns a synchronous thenable so local
+    // boot (and the headless test harness) stays single-pass.
+    loaded: function () {
+      if (this._beat) { clearInterval(this._beat); this._beat = null; }
+      this._send(100);
+      if (!this.has) return { then: function (fn) { fn(); return this; } };
+      try {
+        var r = window.GamePix.loaded();
+        return (r && typeof r.then === 'function') ? r : Promise.resolve();
+      } catch (e) { return Promise.resolve(); }
+    },
+
+    ping: function (name) {
+      if (!this.has) return;
+      try {
+        var gp = window.GamePix;
+        var c = gp.CONST && gp.CONST[name];
+        if (c !== undefined && c !== null) gp.ping(c);
+      } catch (e) { /* analytics must never break play */ }
+    },
+
+    updateLevel: function (n) {
+      if (!this.has) return;
+      try { window.GamePix.updateLevel(n); } catch (e) { /* ignore */ }
+    },
+
+    score: function (n) {
+      if (!this.has) return;
+      try { window.GamePix.updateScore(n); } catch (e) { /* ignore */ }
+    },
+
+    // SDK 3.0 lifecycle: gameAction when real play begins,
+    // gameStop when the run ends and we return to the menu.
+    action: function () {
+      if (!this.has) return;
+      try {
+        if (typeof window.GamePix.gameAction === 'function') {
+          window.GamePix.gameAction();
+        }
+      } catch (e) { /* ignore */ }
+    },
+
+    stop: function () {
+      if (!this.has) return;
+      try {
+        if (typeof window.GamePix.gameStop === 'function') {
+          window.GamePix.gameStop();
+        }
+      } catch (e) { /* ignore */ }
+    },
+
+    happy: function () {
+      if (!this.has) return;
+      try { window.GamePix.happyMoment(); } catch (e) { /* ignore */ }
+    },
+
+    sad: function () {
+      if (!this.has) return;
+      try { window.GamePix.sadMoment(); } catch (e) { /* ignore */ }
+    }
+  };
+
+})(window.TD);
