@@ -421,9 +421,6 @@
         });
       }
 
-      TD.Platform.init();
-      TD.Platform.loading(10);
-
       var hb = document.getElementById('help-btn');
       if (hb) {
         hb.addEventListener('pointerdown', function (e) {
