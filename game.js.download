@@ -421,17 +421,6 @@
         });
       }
 
-      TD.Ads.hooks.onPause = function () {
-        self.adPaused = true;
-        TD.Audio.duck(true);
-        self.syncHelpBtn();
-      };
-      TD.Ads.hooks.onResume = function () {
-        self.adPaused = false;
-        TD.Audio.duck(false);
-        self.syncHelpBtn();
-      };
-      TD.Ads.init();
       TD.Platform.init();
       TD.Platform.loading(10);
 
